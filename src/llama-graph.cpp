@@ -1418,6 +1418,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    for (int i = 0; i < 2; ++i) {
+        if (self_k_pos[i] && self_k_pos[i]->buffer) {
+            (i ? attn_ctx->get_swa() : attn_ctx->get_base())->set_input_cell_pos(self_k_pos[i], ubatch);
+        }
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1432,6 +1438,26 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
+    // padded banded: query i is at cell n_kv_used - n_tokens + i, the op aligns it to n_kv - n_tokens + i,
+    // so band column j holds distance j - (n_kv - n_kv_used)
+    for (int i = 0; i < 2; ++i) {
+        ggml_tensor * shift = self_rel_shift[i];
+        if (!shift || !shift->buffer) {
+            continue;
+        }
+        const auto *   kv_ctx = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+        const uint32_t n_used = kv_ctx->get_n_kv_pos_contiguous();
+        const int32_t  ext    = i ? extent_swa : extent;
+        GGML_ASSERT(n_used > 0 && n_used <= n_kv_banded[i] && n_kv_banded[i] - n_used < n_rel_pad);
+        GGML_ASSERT(shift->ne[0] == ext + (int64_t) n_rel_pad);
+        const int32_t delta = n_kv_banded[i] - n_used;
+        std::vector<int32_t> data(shift->ne[0]);
+        for (int32_t j = 0; j < (int32_t) data.size(); ++j) {
+            data[j] = j >= delta && j - delta < ext ? j - delta : ext;
+        }
+        ggml_backend_tensor_set(shift, data.data(), 0, ggml_nbytes(shift));
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1443,6 +1469,27 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+}
+
+uint32_t llm_graph_input_mem_hybrid_iswa_rel::get_n_kv_banded(
+        const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const {
+    // one sequence whose cells are its positions: the cell distance is the position distance
+    const uint32_t n_used = ubatch.n_seqs_unq == 1 ? kv->get_n_kv_pos_contiguous() : 0;
+    use_pos = banded_pos != 0 && (n_used == 0 || banded_pos == 2);
+    if (use_pos) {
+        return kv->get_n_kv();
+    }
+    if (!banded_pad || n_used == 0) {
+        return n_used;
+    }
+    // padded: the shift table covers a padding of less than n_rel_pad cells, one sequence alone in the cache always
+    // fits; else the positions, if allowed
+    const uint32_t n_kv = kv->get_n_kv();
+    if (n_used <= n_kv && n_kv - n_used < n_rel_pad) {
+        return n_kv;
+    }
+    use_pos = banded_pos != 0;
+    return use_pos ? n_kv : 0;
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1475,6 +1522,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    if (banded) {
+        for (int i = 0; i < 2; ++i) {
+            bool use_pos = false;
+            const uint32_t n = i == 1 && banded_swa_dense ? 0 :
+                get_n_kv_banded(i ? attn_ctx->get_swa() : attn_ctx->get_base(), params.ubatch, use_pos);
+            res &= n == n_kv_banded[i];
+            res &= use_pos == (self_k_pos[i] != nullptr);
+        }
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1809,7 +1866,8 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+        enum ggml_prec   prec) const {
     if (!w_s) {
         w_s = model.get_w_scale(w);
     }
@@ -1824,6 +1882,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
 
     prec_policy.apply(res, w);
+
+    if (prec != GGML_PREC_UNDEFINED) {
+        // explicit precision wins; set on the base MUL_MAT before scale/LoRA changes the root op
+        ggml_prec_set_acc(res, prec);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -4410,6 +4473,22 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
+    if (cparams.flash_attn && kq_b->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16 && hparams.f_max_alibi_bias == 0.0f) {
+        // convert the bias to F16 in one copy, from the source of its contiguous copy when it is one (the same values),
+        // and add the mask in F16: the mask is 0 or -inf, so this rounds the same as adding in F32 and converting
+        ggml_tensor * src = kq_b->op == GGML_OP_CONT ? kq_b->src[0] : kq_b;
+        // a cast, not a copy into a new tensor: that tensor would be a graph leaf, which the allocator keeps
+        // for the whole graph, so the bias of every chunk and layer would stay allocated at once
+        ggml_tensor * bias = ggml_cast(ctx0, src, GGML_TYPE_F16);
+        if (kq_b->ne[1] != kq_mask->ne[1]) {
+            kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_b->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]);
+        }
+        kq_mask = ggml_add(ctx0, bias, kq_mask);
+        cb(kq_mask, "kq_mask_rel_pos", il);
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
     if (kq_b->ne[1] != kq_mask->ne[1]) {
         ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
         if (!dev) {

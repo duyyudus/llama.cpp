@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -194,6 +195,9 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
+    uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -250,6 +254,10 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_cell_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // idx(i, j) = i*(extent + 1) + rel; out-of-band cells map to the zero column `extent`
+    void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -418,6 +426,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_pos_contiguous() const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_size() const;
 
@@ -456,15 +465,18 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_cell_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const; // inkling
+
 private:
     llama_memory_status status;
 
-    llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_kv_cache * kv = nullptr;
+    llama_context * lctx = nullptr;
 
     //
     // update context
@@ -480,6 +492,11 @@ private:
 
     // the index of the cur ubatch to process
     size_t i_cur = 0;
+
+    // get_n_kv_pos_contiguous() of ubatch i_cur once applied: the check scans the cells of the sequence, and the
+    // graph build or reuse check and set_input each ask for it
+    mutable size_t   i_pos_contiguous = SIZE_MAX;
+    mutable uint32_t n_pos_contiguous = 0;
 
     slot_info_vec_t sinfos;
 

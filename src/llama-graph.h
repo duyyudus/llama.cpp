@@ -811,6 +811,30 @@ public:
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
+    // [base, swa] K/V cells of the banded attention, 0 = dense
+    uint32_t n_kv_banded[2] = { 0, 0 };
+    bool     banded         = false;
+
+    // padded: the banded attention spans the padded n_kv, which changes only every 256 cells, so that the graph of
+    // a small ubatch is reused. The empty cells past the sequence are masked, and the band is shifted by the padding
+    // through self_rel_shift, the row of the relative bias for each band column, extent past the band (a zero row)
+    bool          banded_pad        = false;
+    bool          banded_swa_dense  = false; // the graph keeps the SWA layers dense
+    ggml_tensor * self_rel_shift[2] = { nullptr, nullptr }; // I32 [extent + n_rel_pad], [extent_swa + n_rel_pad]
+
+    static constexpr uint32_t n_rel_pad = 256;
+
+    // [base, swa] I32 [n_kv] position of each cell (-1 if empty), when the banded attention takes the distances
+    // from the positions: the cells of several sequences, or a wrapped cache. Null when the cells are the positions
+    ggml_tensor * self_k_pos[2] = { nullptr, nullptr };
+    // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
+    // banded ubatch, also when the cells are the positions (a check: the result must not change)
+    int banded_pos = 0;
+
+    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes,
+    // and whether it takes the positions
+    uint32_t get_n_kv_banded(const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1187,7 +1211,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+            enum ggml_prec   prec = GGML_PREC_UNDEFINED) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
