@@ -1898,6 +1898,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+    std::vector<size_t> free_mem(n_devices(), 0);
     std::vector<float> splits(n_devices());
     if (all_zero) {
         // default split, by free memory
@@ -1913,7 +1914,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (free == 0 && total == 0) {
                 ggml_backend_dev_memory(cpu_dev, &free, &total);
             }
-            splits[i] = free;
+            free_mem[i] = free;
+            splits[i] = (float) free;
         }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
@@ -1941,6 +1943,156 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_weights + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_weights + 1);
+
+    // custom per-rank device placement for automatic multi-GPU splits
+    std::vector<ggml_backend_dev_t> rank_dev(n_layer_weights + 1, nullptr);
+    bool use_custom_layout = false;
+
+    if (split_mode == LLAMA_SPLIT_MODE_LAYER && all_zero && n_devices() >= 2 &&
+        i_gpu_start == 0 && act_gpu_layers == n_layer_weights + 1) {
+        const char * fn = __func__;
+        const size_t primary = (params.main_gpu >= 0 && (size_t) params.main_gpu < n_devices()) ? (size_t) params.main_gpu : 0;
+
+        int loop_start  = 0;
+        int loop_end    = 0;
+        int loop_passes = 0;
+
+        if (loop_core_range(loop_start, loop_end, loop_passes) &&
+            loop_start >= 0 && loop_start < loop_end && loop_end <= n_layer_weights) {
+            std::vector<size_t> rank_bytes(n_layer_weights + 1, 0);
+            for (const auto & [name, weight] : ml.weights_map) {
+                if (name == "token_embd.weight") {
+                    continue;
+                }
+                int bid = -1;
+                const int ir = (sscanf(name.c_str(), "blk.%d.", &bid) == 1 && bid >= 0 && bid < n_layer_weights) ? bid : n_layer_weights;
+                rank_bytes[ir] += ggml_nbytes(weight.tensor);
+            }
+
+            size_t bytes_pre  = 0;
+            size_t bytes_core = 0;
+            size_t bytes_post = 0;
+            for (int ir = 0; ir <= n_layer_weights; ++ir) {
+                if (ir < loop_start) {
+                    bytes_pre += rank_bytes[ir];
+                } else if (ir < loop_end) {
+                    bytes_core += rank_bytes[ir];
+                } else {
+                    bytes_post += rank_bytes[ir];
+                }
+            }
+
+            // leave headroom on each device for long-context KV cache, compute buffers, and WDDM overhead
+            auto dev_cap = [&](size_t d) -> size_t {
+                const size_t margin = std::min<size_t>(free_mem[d] / 5, 2ULL * 1024 * 1024 * 1024);
+                return free_mem[d] > margin ? free_mem[d] - margin : 0;
+            };
+            auto primary_kv_cap = [&](size_t d) -> size_t {
+                const size_t margin = std::min<size_t>((free_mem[d] * 2) / 5, 5632ULL * 1024 * 1024);
+                return free_mem[d] > margin ? free_mem[d] - margin : 0;
+            };
+
+            if (n_devices() == 2) {
+                const size_t secondary = 1 - primary;
+
+                auto assign_split = [&](int cut, size_t dev_first, size_t dev_second, const char * desc) {
+                    for (int ir = 0; ir <= n_layer_weights; ++ir) {
+                        rank_dev[ir] = devices[ir < cut ? dev_first : dev_second].dev;
+                    }
+                    use_custom_layout = true;
+                    LLAMA_LOG_INFO("%s: loop-aware split (%s): [0, %d) -> %s, [%d, %d] -> %s\n",
+                            fn, desc,
+                            cut, ggml_backend_dev_name(devices[dev_first].dev),
+                            cut, n_layer_weights, ggml_backend_dev_name(devices[dev_second].dev));
+                };
+
+                if (loop_start > 0 && bytes_core + bytes_post <= primary_kv_cap(primary) && bytes_pre <= dev_cap(secondary)) {
+                    assign_split(loop_start, secondary, primary, "prelude offloaded");
+                } else if (loop_start > 0 && bytes_core <= primary_kv_cap(primary)) {
+                    // keep looped core intact on primary and spill just enough postlude tail to secondary for KV + WDDM headroom
+                    const size_t cap_pri = primary_kv_cap(primary);
+                    const size_t cap_sec = dev_cap(secondary);
+                    size_t used_pri = bytes_core + bytes_post;
+                    size_t used_sec = bytes_pre;
+                    int cut_post = n_layer_weights + 1;
+                    while (cut_post > loop_end && used_pri > cap_pri) {
+                        --cut_post;
+                        used_pri -= rank_bytes[cut_post];
+                        used_sec += rank_bytes[cut_post];
+                    }
+                    if (used_pri <= cap_pri && used_sec <= cap_sec) {
+                        for (int ir = 0; ir <= n_layer_weights; ++ir) {
+                            const size_t d = (ir >= loop_start && ir < cut_post) ? primary : secondary;
+                            rank_dev[ir] = devices[d].dev;
+                        }
+                        use_custom_layout = true;
+                        LLAMA_LOG_INFO("%s: loop-aware split (prelude + postlude tail offloaded): [%d, %d) -> %s (%.1f MiB), rest -> %s (%.1f MiB)\n",
+                                fn, loop_start, cut_post, ggml_backend_dev_name(devices[primary].dev), used_pri / (1024.0 * 1024.0),
+                                ggml_backend_dev_name(devices[secondary].dev), used_sec / (1024.0 * 1024.0));
+                    }
+                }
+
+                if (!use_custom_layout) {
+                    if (loop_start > 0 && bytes_core + bytes_post <= dev_cap(primary) && bytes_pre <= dev_cap(secondary)) {
+                        assign_split(loop_start, secondary, primary, "prelude offloaded");
+                    } else if (bytes_pre + bytes_core <= dev_cap(primary) && bytes_post <= dev_cap(secondary)) {
+                        assign_split(loop_end, primary, secondary, "postlude offloaded");
+                    } else if (loop_start > 0 && bytes_pre <= dev_cap(primary) && bytes_core + bytes_post <= dev_cap(secondary)) {
+                        assign_split(loop_start, primary, secondary, "core on secondary");
+                    }
+                }
+            } else {
+                auto default_gpu = [&](int ir) -> size_t {
+                    return std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(ir)/act_gpu_layers) - splits.begin();
+                };
+                const size_t g_start = default_gpu(loop_start);
+                const size_t g_end   = default_gpu(loop_end - 1);
+                if (g_start != g_end) {
+                    auto try_snap = [&](size_t target_g) -> bool {
+                        std::vector<size_t> used(n_devices(), 0);
+                        for (int ir = 0; ir <= n_layer_weights; ++ir) {
+                            const size_t g = (ir >= loop_start && ir < loop_end) ? target_g : default_gpu(ir);
+                            rank_dev[ir] = devices[g].dev;
+                            used[g] += rank_bytes[ir];
+                        }
+                        return used[target_g] <= dev_cap(target_g);
+                    };
+                    if (try_snap(g_start) || try_snap(g_end)) {
+                        use_custom_layout = true;
+                        LLAMA_LOG_INFO("%s: loop-aware split: kept loop core [%d, %d) intact on %s\n",
+                                fn, loop_start, loop_end, ggml_backend_dev_name(rank_dev[loop_start]));
+                    }
+                }
+            }
+        } else if (arch == LLM_ARCH_DFLASH) {
+            // keep small draft models unbroken on the GPU with the most free VRAM (also co-locates with target lm_head when postlude tail is offloaded)
+            size_t total_bytes = 0;
+            for (const auto & [name, weight] : ml.weights_map) {
+                if (name == "token_embd.weight") {
+                    continue;
+                }
+                total_bytes += ggml_nbytes(weight.tensor);
+            }
+
+            size_t best = 0;
+            for (size_t d = 1; d < n_devices(); ++d) {
+                if (free_mem[d] > free_mem[best]) {
+                    best = d;
+                }
+            }
+
+            const size_t margin = 512ULL * 1024 * 1024;
+            if (free_mem[best] >= total_bytes + margin) {
+                for (int ir = 0; ir <= n_layer_weights; ++ir) {
+                    rank_dev[ir] = devices[best].dev;
+                }
+                use_custom_layout = true;
+                LLAMA_LOG_INFO("%s: keeping DFlash/DSpark intact on %s (%.1f MiB)\n",
+                        fn, ggml_backend_dev_name(devices[best].dev), total_bytes / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         const int  ir     = layer_rank[il];
@@ -1948,8 +2100,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(ir - i_gpu_start)/act_gpu_layers) - splits.begin();
-        auto * dev = devices.at(layer_gpu).dev;
+        auto * dev = use_custom_layout ? rank_dev[ir] :
+            devices.at(std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(ir - i_gpu_start)/act_gpu_layers) - splits.begin()).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };

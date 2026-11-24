@@ -2617,6 +2617,13 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     // every cache slot runs on the device of the physical layer it shares the weights of
     int32_t layer_weights(int32_t il) const override { return layer_phys(il); }
+
+    bool loop_core_range(int & start, int & end, int & passes) const override {
+        start  = (int) core_start;
+        end    = (int) core_end;
+        passes = (int) n_passes;
+        return n_passes > 1;
+    }
 };
 
 struct llama_model_lfm2 : public llama_model_base {

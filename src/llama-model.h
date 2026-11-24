@@ -1106,6 +1106,14 @@ struct llama_model {
     // the layer whose weights layer il uses (looped layers share the weights of their first visit)
     virtual int32_t layer_weights(int32_t il) const { return il; }
 
+    // physical rank range [start, end) repeated `passes` times (returns false if not looped)
+    virtual bool loop_core_range(int & start, int & end, int & passes) const {
+        GGML_UNUSED(start);
+        GGML_UNUSED(end);
+        GGML_UNUSED(passes);
+        return false;
+    }
+
     // layers that hold weights: the unit of n_gpu_layers and of the device splits
     uint32_t n_layer_weights() const;
 
