@@ -1,5 +1,8 @@
 # llama.cpp
 
+> [!NOTE]
+> **Fork optimizations (`opt/2gpu-fast`):** This fork adds loop-aware 2-GPU layer splitting, Inkling-2 / Ada (`sm_89`) CUDA kernel fusions, `Q8_0` relative-bias FlashAttention, batched H2D input copies, and zero-distribution backend sampling (`-bs`). See [docs/fork-optimizations.md](docs/fork-optimizations.md) for the full changelog, benchmarks, 200k/256k VRAM stress tests, and accuracy verification.
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
