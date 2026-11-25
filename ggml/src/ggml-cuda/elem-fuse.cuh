@@ -20,6 +20,47 @@ int ggml_cuda_match_tanh_mul_addsub(const ggml_cgraph * cgraph, int i, ggml_cuda
 
 void ggml_cuda_op_tanh_mul_addsub(ggml_backend_cuda_context & ctx, const ggml_cuda_tanh_mul_addsub_match & match);
 
+// y = (cur - tanh(wf*gate)*cur) + tanh(wg*gate)*msg for small T (<= 3)
+struct ggml_cuda_ctrl_mmvf_gate_match {
+    const ggml_tensor * wf   = nullptr;
+    const ggml_tensor * wg   = nullptr;
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * cur  = nullptr;
+    const ggml_tensor * msg  = nullptr;
+    ggml_tensor       * dst  = nullptr;
+};
+
+int ggml_cuda_match_ctrl_mmvf_gate(const ggml_cgraph * cgraph, int i, ggml_cuda_ctrl_mmvf_gate_match & match);
+
+void ggml_cuda_op_ctrl_mmvf_gate(ggml_backend_cuda_context & ctx, const ggml_cuda_ctrl_mmvf_gate_match & match);
+
+// out = rms_norm((cur - tanh(af)*cur) + tanh(ag)*msg) * weight
+struct ggml_cuda_ctrl_gate_rms_norm_mul_match {
+    const ggml_tensor * af  = nullptr;
+    const ggml_tensor * ag  = nullptr;
+    const ggml_tensor * cur = nullptr;
+    const ggml_tensor * msg = nullptr;
+    const ggml_tensor * w   = nullptr;
+    ggml_tensor       * dst = nullptr;
+    float               eps = 0.0f;
+};
+
+int ggml_cuda_match_ctrl_gate_rms_norm_mul(const ggml_cgraph * cgraph, int i, ggml_cuda_ctrl_gate_rms_norm_mul_match & match);
+
+void ggml_cuda_op_ctrl_gate_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_cuda_ctrl_gate_rms_norm_mul_match & match);
+
+// dst = W * concat(a, b, dim=0) for small T (<= 3)
+struct ggml_cuda_concat_mmvf_match {
+    const ggml_tensor * w   = nullptr;
+    const ggml_tensor * a   = nullptr;
+    const ggml_tensor * b   = nullptr;
+    ggml_tensor       * dst = nullptr;
+};
+
+int ggml_cuda_match_concat_mmvf(const ggml_cgraph * cgraph, int i, ggml_cuda_concat_mmvf_match & match);
+
+void ggml_cuda_op_concat_mmvf(ggml_backend_cuda_context & ctx, const ggml_cuda_concat_mmvf_match & match);
+
 // normalized router weights: SUM_ROWS, SCALE or CLAMP, DIV[, RESHAPE, SCALE]
 struct ggml_cuda_row_norm_div_match {
     const ggml_tensor * x   = nullptr;

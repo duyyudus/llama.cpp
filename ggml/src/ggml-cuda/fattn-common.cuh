@@ -54,6 +54,7 @@ struct fattn_rel_bias {
     int64_t tab_h, tab_r, tab_q, tab_s;
     int64_t sub_h, sub_q, sub_s;
     int64_t rp_kv, rp_q, rp_s;
+    int32_t tab_nrows; // > 0: rows past tab_nrows read as 0.0f (elided right-pad)
     int skip_debug; // GGML_CUDA_FA_VEC_MASK_SKIP_DEBUG: print the KV chunks the vector kernel skipped
 };
 
@@ -85,7 +86,8 @@ typedef void (* fattn_rel_kernel_t)(
 static __device__ __forceinline__ half fattn_rel_bias_value(
         const fattn_rel_bias & rel, const int h, const int q, const int s, const int kv, const half m) {
     const int idx = *(const int *) (rel.rp + kv*rel.rp_kv + q*rel.rp_q + s*rel.rp_s);
-    float v = *(const float *) (rel.tab + h*rel.tab_h + int64_t(idx)*rel.tab_r + q*rel.tab_q + s*rel.tab_s);
+    float v = (rel.tab_nrows > 0 && idx >= rel.tab_nrows) ? 0.0f :
+        *(const float *) (rel.tab + h*rel.tab_h + int64_t(idx)*rel.tab_r + q*rel.tab_q + s*rel.tab_s);
     if (rel.sub) {
         v = __fsub_rn(v, *(const float *) (rel.sub + h*rel.sub_h + q*rel.sub_q + s*rel.sub_s));
     }

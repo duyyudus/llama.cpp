@@ -4782,8 +4782,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // y = c -/+ tanh(a)*b: UNARY(TANH), MUL, SUB/ADD
+    // control gate matvec + double tanh_mul_addsub for small T: MUL_MAT, MUL_MAT, TANH, MUL, SUB, TANH, [VIEW,] MUL, ADD
+    if (node->op == GGML_OP_MUL_MAT) {
+        static const bool ctrl_mmvf_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CTRL_FUSION");
+        ggml_cuda_ctrl_mmvf_gate_match match;
+        const int n = ctrl_mmvf_disabled ? 0 : ggml_cuda_match_ctrl_mmvf_gate(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_ctrl_mmvf_gate(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
+    // control gate + rms_norm + weight mul, or single y = c -/+ tanh(a)*b
     if (node->op == GGML_OP_UNARY) {
+        static const bool ctrl_gate_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CTRL_FUSION");
+        ggml_cuda_ctrl_gate_rms_norm_mul_match ctrl_match;
+        const int n_ctrl = ctrl_gate_disabled ? 0 : ggml_cuda_match_ctrl_gate_rms_norm_mul(cgraph, i, ctrl_match);
+        if (n_ctrl > 0) {
+            ggml_cuda_op_ctrl_gate_rms_norm_mul(*cuda_ctx, ctrl_match);
+            return n_ctrl - 1;
+        }
+
         static const bool tanh_mul_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_TANH_MUL_ADDSUB_FUSION");
         ggml_cuda_tanh_mul_addsub_match match;
         // the elementwise kernel may run in place: the matcher checks the overlaps
@@ -4806,11 +4825,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // ADD, [RESHAPE,] RMS_NORM of the sum: one kernel writes the sum and the norm
-    // bit-identical to the separate ADD + RMS_NORM only where measured: NVIDIA cc >= 10.0 (B200, RTX PRO 6000); it is
-    // 1 ulp off on T4, L4, A100 and HIP, so it stays off there
     if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes &&
             GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            ggml_cuda_info().devices[cuda_ctx->device].cc >= 1000) {
+            ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         static const bool add_rms_norm_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_ADD_RMS_NORM_FUSION");
         const bool has_reshape = cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE;
         const int  n           = has_reshape ? 3 : 2;
@@ -4869,6 +4886,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_fused = conv_chain_disabled ? 0 : ggml_cuda_try_fuse_conv_chain(*cuda_ctx, cgraph, i);
         if (n_fused > 0) {
             return n_fused;
+        }
+
+        static const bool ctrl_concat_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CTRL_FUSION");
+        ggml_cuda_concat_mmvf_match cat_mm_match;
+        const int n_cat_mm = ctrl_concat_disabled ? 0 : ggml_cuda_match_concat_mmvf(cgraph, i, cat_mm_match);
+        if (n_cat_mm > 0) {
+            ggml_cuda_op_concat_mmvf(*cuda_ctx, cat_mm_match);
+            return n_cat_mm - 1;
         }
     }
 
@@ -4969,7 +4994,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // relative-position bias gathered into the F16 mask of a flash attention: read in the vector kernel
-    if (node->op == GGML_OP_SUB || node->op == GGML_OP_CONT || node->op == GGML_OP_GET_ROWS) {
+    if (node->op == GGML_OP_PAD || node->op == GGML_OP_SUB || node->op == GGML_OP_CONT || node->op == GGML_OP_GET_ROWS) {
         static const bool rel_bias_fa_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_REL_BIAS_FA_FUSION");
         const int n_fused = rel_bias_fa_disabled || !cuda_ctx->stream_context().concurrent_events.empty() ? 0 :
             ggml_cuda_try_fuse_rel_bias_fa(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);

@@ -26,6 +26,9 @@ static bool ggml_cuda_flash_attn_ext_vec_rel(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_REL_CASE( 64, GGML_TYPE_BF16, GGML_TYPE_BF16)
     FATTN_VEC_REL_CASE(128, GGML_TYPE_BF16, GGML_TYPE_BF16)
     FATTN_VEC_REL_CASE(256, GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_REL_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_REL_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_REL_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #undef FATTN_VEC_REL_CASE
 
     return false;
@@ -58,7 +61,7 @@ static bool ggml_cuda_rel_overlap(const ggml_tensor * a, const ggml_tensor * b) 
 int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
         bool (*compute)(ggml_backend_cuda_context & ctx, ggml_tensor * dst)) {
     const ggml_tensor * node = cgraph->nodes[i];
-    if (node->op != GGML_OP_SUB && node->op != GGML_OP_CONT && node->op != GGML_OP_GET_ROWS) {
+    if (node->op != GGML_OP_PAD && node->op != GGML_OP_SUB && node->op != GGML_OP_CONT && node->op != GGML_OP_GET_ROWS) {
         return 0;
     }
 
@@ -169,13 +172,35 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
         }
     }
 
+    const ggml_tensor * pad = nullptr;
+    if (sub && sub->src[0]->op == GGML_OP_PAD) {
+        const ggml_tensor * P = sub->src[0];
+        const int32_t * pp = (const int32_t *) P->op_params;
+        if (pp[0] == 0 && pp[1] == 1 && pp[2] == 0 && pp[3] == 0 && pp[4] == 0 && pp[5] == 0 && pp[6] == 0 && pp[7] == 0 && pp[8] == 0 &&
+                P->type == GGML_TYPE_F32 && P->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(P->src[0]) &&
+                P->ne[0] == P->src[0]->ne[0] + 1 && P->ne[1] == P->src[0]->ne[1] && P->ne[2] == P->src[0]->ne[2] && P->ne[3] == 1 &&
+                ggml_cuda_rel_use_count(cgraph, P) == 1 && !(P->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            pad = P;
+        }
+    }
+
     const int64_t view_offs = (const char *) view->data - (const char *) tab_src->data;
-    const ggml_tensor * tab = sub ? sub->src[0] : tab_src;
-    rel.tab   = (const char *) tab->data + view_offs;
-    rel.tab_h = view->nb[0];
-    rel.tab_r = view->nb[1];
-    rel.tab_q = view->nb[2];
-    rel.tab_s = nr*view->nb[2];
+    const ggml_tensor * tab = pad ? pad->src[0] : sub ? sub->src[0] : tab_src;
+    if (pad) {
+        rel.tab       = (const char *) tab->data;
+        rel.tab_h     = tab->nb[1];
+        rel.tab_r     = tab->nb[0];
+        rel.tab_q     = tab->nb[2];
+        rel.tab_s     = nr*tab->nb[2];
+        rel.tab_nrows = (int32_t) tab->ne[0];
+    } else {
+        rel.tab       = (const char *) tab->data + view_offs;
+        rel.tab_h     = view->nb[0];
+        rel.tab_r     = view->nb[1];
+        rel.tab_q     = view->nb[2];
+        rel.tab_s     = nr*view->nb[2];
+        rel.tab_nrows = 0;
+    }
     if (sub) {
         const ggml_tensor * B = sub->src[1];
         rel.sub   = (const char *) B->data;
@@ -185,11 +210,11 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
     }
 
     // the chain starts at node i, and every other node up to the flash attention is a view or a chain node
-    const ggml_tensor * start = sub ? (const ggml_tensor *) sub : cont ? cont : G;
+    const ggml_tensor * start = pad ? pad : sub ? (const ggml_tensor *) sub : cont ? cont : G;
     if (node != start) {
         return 0;
     }
-    const ggml_tensor * chain[] = { sub, cont, G, cpy, add };
+    const ggml_tensor * chain[] = { pad, sub, cont, G, cpy, add };
     auto in_chain = [&](const ggml_tensor * t) {
         for (const ggml_tensor * c : chain) {
             if (t && c && (t == c || t->view_src == c)) {
@@ -201,7 +226,7 @@ int ggml_cuda_try_fuse_rel_bias_fa(ggml_backend_cuda_context & ctx, ggml_cgraph 
     std::vector<ggml_tensor *> others; // computed before the fused kernel, in graph order
     for (int k = i + 1; k < f; ++k) {
         ggml_tensor * t = cgraph->nodes[k];
-        if (t == cont || t == G || t == cpy || t == add || ggml_is_empty(t) ||
+        if (t == sub || t == cont || t == G || t == cpy || t == add || ggml_is_empty(t) ||
                 t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
                 t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
             continue;

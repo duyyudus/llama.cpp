@@ -11,7 +11,7 @@
 
 #define DEPTH_MIX_BLOCK 1024
 #define DEPTH_MIX_MAX_N 32
-#define DEPTH_MIX_MAX_NQ 3
+#define DEPTH_MIX_MAX_NQ 4
 #define DEPTH_MIX_MAX_NCOLS 8192
 
 struct depth_mix_params {
@@ -46,11 +46,15 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
     const int     n     = p.n;
 
     ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += DEPTH_MIX_BLOCK) {
-        normed[col] = p.normed[col + t*p.normed_s2];
+    if (p.normed) {
+        for (int col = tid; col < ncols; col += DEPTH_MIX_BLOCK) {
+            normed[col] = p.normed[col + t*p.normed_s2];
+        }
+        ggml_cuda_pdl_lc();
+        __syncthreads();
+    } else {
+        ggml_cuda_pdl_lc();
     }
-    ggml_cuda_pdl_lc();
-    __syncthreads();
 
     // scores = states^T q as mul_mat_vec_f<float, float, nq, mm_block>: one group of mm_block threads per row
     {
@@ -66,7 +70,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
             const int k = k0 + g;
             float sumf[nq] = {0.0f};
             if (g < ngroups && k < n) {
-                const float2 * x2 = (const float2 *) (k < n - 1 ? p.prev + k*p.prev_s1 + t*p.prev_s2 : normed);
+                const float2 * x2 = (const float2 *) (k < n - 1 || !p.normed ? p.prev + k*p.prev_s1 + t*p.prev_s2 : normed);
                 for (int col2 = gt; col2 < ncols2; col2 += g_size) {
                     const float2 tmpx = x2[col2];
 #pragma unroll
@@ -142,52 +146,31 @@ static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const
     const int e0 = blockIdx.x*p.rows_per_block;
     const int e1 = min(ncols, e0 + p.rows_per_block);
 
-    // out = states_t^T scores as mul_mat_vec_f<float, float, nq, WARP_SIZE> computes it with one warp per row: lane l
-    // accumulates columns 2l and 2l + 1 (n <= 32, one iteration), then warp_reduce_sum adds lane l^o to lane l for
-    // o = 16, 8, 4, 2, 1. Here one thread per row forms the same 32 lane partials (zero past n/2) and the same additions
-    // that end in lane 0. Floating-point addition is commutative, so a + b and b + a round alike.
+    // out = states_t^T scores, handles both even and odd n with low register pressure
     if (p.out) {
-        const int nh = n / 2;
+        const int n_prev = p.normed ? n - 1 : n;
         for (int e = e0 + tid; e < e1; e += DEPTH_MIX_BLOCK) {
             // the earlier rows transposed: a CONCAT of their own, or the plain rows read across (the same values)
             const float * xr  = p.prev_t ? p.prev_t + e*p.prev_t_s1 + t*p.prev_t_s2 : p.prev + e + t*p.prev_s2;
             const int64_t xs  = p.prev_t ? 1 : p.prev_s1;
-            const float   xn  = normed[e];
-            float v[nq][WARP_SIZE/2];
-#pragma unroll
-            for (int l = 0; l < WARP_SIZE/2; ++l) {
+            float v[nq] = {0.0f};
+            for (int k = 0; k < n_prev; ++k) {
+                const float x = xr[k*xs];
 #pragma unroll
                 for (int j = 0; j < nq; ++j) {
-                    v[j][l] = 0.0f;
+                    ggml_cuda_mad(v[j], x, sc[j*n + k]);
                 }
-                if (l < nh) {
-                    const int k = 2*l;
-                    const float x0 = k     < n - 1 ? xr[k*xs]       : xn;
-                    const float x1 = k + 1 < n - 1 ? xr[(k + 1)*xs] : xn;
+            }
+            if (p.normed) {
+                const float xn = normed[e];
 #pragma unroll
-                    for (int j = 0; j < nq; ++j) {
-                        float sumf = 0.0f;
-                        ggml_cuda_mad(sumf, x0, sc[j*n + k]);
-                        ggml_cuda_mad(sumf, x1, sc[j*n + k + 1]);
-                        v[j][l] = sumf;
-                    }
+                for (int j = 0; j < nq; ++j) {
+                    ggml_cuda_mad(v[j], xn, sc[j*n + n - 1]);
                 }
             }
 #pragma unroll
             for (int j = 0; j < nq; ++j) {
-                // o = 16: lanes 16..31 hold 0
-#pragma unroll
-                for (int l = 0; l < WARP_SIZE/2; ++l) {
-                    v[j][l] = __fadd_rn(v[j][l], 0.0f);
-                }
-#pragma unroll
-                for (int o = WARP_SIZE/4; o > 0; o >>= 1) {
-#pragma unroll
-                    for (int l = 0; l < o; ++l) {
-                        v[j][l] = __fadd_rn(v[j][l], v[j][l + o]);
-                    }
-                }
-                p.out[e + j*p.out_s1 + t*p.out_s2] = v[j][0];
+                p.out[e + j*p.out_s1 + t*p.out_s2] = v[j];
             }
         }
     }
@@ -278,93 +261,136 @@ static bool depth_mix_rows_ok(const ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[3] == 1;
 }
 
+static bool depth_mix_is_transpose_stack(const ggml_tensor * s, const ggml_tensor * st, int depth = 0) {
+    if (!s || !st || depth > DEPTH_MIX_MAX_N) {
+        return false;
+    }
+    if (st->op == GGML_OP_RESHAPE && st->src[0] == s &&
+        s->ne[1] == 1 && st->ne[0] == 1 && s->ne[0] == st->ne[1] && s->ne[2] == st->ne[2]) {
+        return true;
+    }
+    if (s->op == GGML_OP_CONCAT && st->op == GGML_OP_CONCAT &&
+        ggml_get_op_params_i32(s, 0) == 1 && ggml_get_op_params_i32(st, 0) == 0) {
+        return depth_mix_is_transpose_stack(s->src[0], st->src[0], depth + 1) &&
+               depth_mix_is_transpose_stack(s->src[1], st->src[1], depth + 1);
+    }
+    return false;
+}
+
 int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, depth_mix_memory_check_t memory_ok) {
     if (depth_mix_shadow()) {
         depth_mix_shadow_check(cgraph, i, ctx->stream());
     }
 
-    // the chain starts after the RMS_NORM of the current state, which stays its own op, in one of two forms:
+    // the chain starts after the RMS_NORM of the current state, which stays its own op, in one of three forms:
     //   (a) CONCAT (prev_t, RESHAPE(normed), dim 0), CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
-    //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]: the transposed rows are a
-    //       copy of the plain ones made right before the product, in any order the graph puts these nodes
+    //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]
+    //   (c) [REPEAT,] MUL_MAT (states, q), SOFT_MAX, MUL_MAT (states_t, scores) over a pre-built stack
     ggml_tensor * first = cgraph->nodes[i];
     const bool form_b = first->op == GGML_OP_CONCAT && ggml_get_op_params_i32(first, 0) == 1 &&
         first->src[1]->op == GGML_OP_RMS_NORM;
+    const bool form_c = first->op == GGML_OP_REPEAT || first->op == GGML_OP_MUL_MAT;
     ggml_tensor * cat_t    = nullptr; // form (a): the transposed CONCAT; form (b): the CONT of the permuted rows
     ggml_tensor * perm     = nullptr; // form (b) only
     const ggml_tensor * normed_t = nullptr;
     const ggml_tensor * rms      = nullptr;
-    if (form_b) {
-        rms = first->src[1];
-    } else {
-        cat_t = first;
-        if (cat_t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat_t, 0) != 0 || cat_t->src[1]->op != GGML_OP_RESHAPE ||
-                cat_t->src[1]->src[0]->op != GGML_OP_RMS_NORM) {
-            return 0;
-        }
-        normed_t = cat_t->src[1];
-        rms      = normed_t->src[0];
-    }
-    if (!depth_mix_rows_ok(rms) || !ggml_is_contiguous(rms) || rms->ne[1] != 1 || rms->ne[3] != 1) {
-        return 0;
-    }
-    const int64_t ncols = rms->ne[0];
-    const int64_t T     = rms->ne[2];
-
     ggml_tensor * cat_s = form_b ? first : nullptr;
     ggml_tensor * rep   = nullptr;
     ggml_tensor * mm1   = nullptr;
     ggml_tensor * sm    = nullptr;
     ggml_tensor * mm2   = nullptr;
     int end = i;
-    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
-        ggml_tensor * node = cgraph->nodes[j];
-        bool ok = false;
-        if (!cat_s && node->op == GGML_OP_CONCAT && node->src[1] == rms && ggml_get_op_params_i32(node, 0) == 1) {
-            cat_s = node; ok = true;
-        } else if (cat_s && !rep && !mm1 && node->op == GGML_OP_REPEAT) {
-            rep = node; ok = true;
-        } else if (cat_s && !mm1 && node->op == GGML_OP_MUL_MAT && node->src[0] == cat_s && (!rep || node->src[1] == rep)) {
-            mm1 = node; ok = true;
-        } else if (mm1 && !sm && node->op == GGML_OP_SOFT_MAX && node->src[0] == mm1) {
-            sm = node; ok = true;
-        } else if (form_b && !perm && node->op == GGML_OP_PERMUTE && node->src[0] == cat_s &&
-                node->op_params[0] == 1 && node->op_params[1] == 0 && node->op_params[2] == 2 && node->op_params[3] == 3) {
-            perm = node; ok = true;
-        } else if (form_b && perm && !cat_t && node->op == GGML_OP_CONT && node->src[0] == perm) {
-            cat_t = node; ok = true;
-        } else if (sm && cat_t && node->op == GGML_OP_MUL_MAT && node->src[0] == cat_t && node->src[1] == sm) {
-            mm2 = node; ok = true;
+
+    if (form_c) {
+        int j = i;
+        if (first->op == GGML_OP_REPEAT) {
+            rep = first;
+            ++j;
         }
-        if (!ok) {
-            break;
+        if (j + 2 >= cgraph->n_nodes) {
+            return 0;
         }
-        end = j;
-        if (mm2) {
-            break;
+        mm1 = cgraph->nodes[j];
+        sm  = cgraph->nodes[j + 1];
+        mm2 = cgraph->nodes[j + 2];
+        if (mm1->op != GGML_OP_MUL_MAT || (rep && mm1->src[1] != rep) ||
+            sm->op != GGML_OP_SOFT_MAX || sm->src[0] != mm1 ||
+            mm2->op != GGML_OP_MUL_MAT || mm2->src[1] != sm) {
+            return 0;
         }
-    }
-    if (!cat_s || !mm1 || !sm) {
-        return 0;
-    }
-    if (form_b && !mm2) {
-        // no product to fuse: keep the chain up to the SOFT_MAX, unless the copy of the rows sits inside it
-        cat_t = nullptr;
-        perm  = nullptr;
+        end = j + 2;
+    } else {
+        if (form_b) {
+            rms = first->src[1];
+        } else {
+            cat_t = first;
+            if (cat_t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat_t, 0) != 0 || cat_t->src[1]->op != GGML_OP_RESHAPE ||
+                    cat_t->src[1]->src[0]->op != GGML_OP_RMS_NORM) {
+                return 0;
+            }
+            normed_t = cat_t->src[1];
+            rms      = normed_t->src[0];
+        }
+        if (!depth_mix_rows_ok(rms) || !ggml_is_contiguous(rms) || rms->ne[1] != 1 || rms->ne[3] != 1) {
+            return 0;
+        }
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
+            ggml_tensor * node = cgraph->nodes[j];
+            bool ok = false;
+            if (!cat_s && node->op == GGML_OP_CONCAT && node->src[1] == rms && ggml_get_op_params_i32(node, 0) == 1) {
+                cat_s = node; ok = true;
+            } else if (cat_s && !rep && !mm1 && node->op == GGML_OP_REPEAT) {
+                rep = node; ok = true;
+            } else if (cat_s && !mm1 && node->op == GGML_OP_MUL_MAT && node->src[0] == cat_s && (!rep || node->src[1] == rep)) {
+                mm1 = node; ok = true;
+            } else if (mm1 && !sm && node->op == GGML_OP_SOFT_MAX && node->src[0] == mm1) {
+                sm = node; ok = true;
+            } else if (form_b && !perm && node->op == GGML_OP_PERMUTE && node->src[0] == cat_s &&
+                    node->op_params[0] == 1 && node->op_params[1] == 0 && node->op_params[2] == 2 && node->op_params[3] == 3) {
+                perm = node; ok = true;
+            } else if (form_b && perm && !cat_t && node->op == GGML_OP_CONT && node->src[0] == perm) {
+                cat_t = node; ok = true;
+            } else if (sm && cat_t && node->op == GGML_OP_MUL_MAT && node->src[0] == cat_t && node->src[1] == sm) {
+                mm2 = node; ok = true;
+            }
+            if (!ok) {
+                break;
+            }
+            end = j;
+            if (mm2) {
+                break;
+            }
+        }
+        if (!cat_s || !mm1 || !sm) {
+            return 0;
+        }
+        if (form_b && !mm2) {
+            // no product to fuse: keep the chain up to the SOFT_MAX, unless the copy of the rows sits inside it
+            cat_t = nullptr;
+            perm  = nullptr;
+        }
     }
 
-    const ggml_tensor * prev   = cat_s->src[0];
-    const ggml_tensor * prev_t = form_b ? nullptr : cat_t->src[0];
-    const int64_t n  = cat_s->ne[1];
-    const int64_t nq = mm1->ne[1];
+    const ggml_tensor * prev   = form_c ? mm1->src[0] : cat_s->src[0];
+    const ggml_tensor * prev_t = form_c ? (depth_mix_is_transpose_stack(mm1->src[0], mm2->src[0]) ? nullptr : mm2->src[0])
+                                        : (form_b ? nullptr : cat_t->src[0]);
+    const int64_t ncols = form_c ? prev->ne[0] : rms->ne[0];
+    const int64_t T     = form_c ? prev->ne[2] : rms->ne[2];
+    const int64_t n     = form_c ? prev->ne[1] : cat_s->ne[1];
+    const int64_t nq    = mm1->ne[1];
 
-    if (!depth_mix_rows_ok(prev) || !depth_mix_rows_ok(cat_s) || !depth_mix_rows_ok(mm1) || !depth_mix_rows_ok(sm) ||
+    if (!depth_mix_rows_ok(prev) || !depth_mix_rows_ok(mm1) || !depth_mix_rows_ok(sm) ||
         (mm2 && !depth_mix_rows_ok(mm2)) ||
-        prev->ne[0] != ncols || prev->ne[1] != n - 1 || prev->ne[2] != T ||
+        (!form_c && (!depth_mix_rows_ok(cat_s) || prev->ne[0] != ncols || prev->ne[1] != n - 1 || prev->ne[2] != T)) ||
+        (form_c && (!depth_mix_rows_ok(mm2->src[0]) || mm2->src[0]->ne[0] != n || mm2->src[0]->ne[1] != ncols || mm2->src[0]->ne[2] != T ||
+            mm2->ne[0] != ncols || mm2->ne[1] != nq || mm2->ne[2] != T)) ||
         (cat_t && (!depth_mix_rows_ok(cat_t) || cat_t->ne[0] != n || cat_t->ne[1] != ncols || cat_t->ne[2] != T)) ||
         (form_b && cat_t && !ggml_is_contiguous(cat_t)) ||
-        (!form_b && (!depth_mix_rows_ok(prev_t) || prev_t->ne[0] != n - 1 || prev_t->ne[1] != ncols || prev_t->ne[2] != T ||
+        (!form_b && !form_c && (!depth_mix_rows_ok(prev_t) || prev_t->ne[0] != n - 1 || prev_t->ne[1] != ncols || prev_t->ne[2] != T ||
             normed_t->ne[0] != 1 || normed_t->ne[1] != ncols || normed_t->ne[2] != T))) {
+        if (form_c) {
+            return 0;
+        }
         DEPTH_MIX_DECLINE("shapes");
     }
     // the scores read the earlier rows of the stack as float2: an F32 view at an odd float offset or with an odd row or
@@ -375,6 +401,9 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     }
     if (n < 2 || n > DEPTH_MIX_MAX_N || nq < 1 || nq > DEPTH_MIX_MAX_NQ || ncols % 2 != 0 || ncols > DEPTH_MIX_MAX_NCOLS ||
         mm1->ne[0] != n || mm1->ne[2] != T) {
+        if (form_c) {
+            return 0;
+        }
         DEPTH_MIX_DECLINE("sizes");
     }
 
@@ -405,19 +434,14 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_ADA_LOVELACE && T <= 8) {
         DEPTH_MIX_DECLINE("decode-size mix before Ada");
     }
-    auto takes_mmvf = [&](const ggml_tensor * mm) {
-        const ggml_tensor * src0 = mm->src[0];
-        const ggml_tensor * src1 = mm->src[1];
-        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-            && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-        return !bad_padding_clear && src1->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
-            !ggml_cuda_op_mul_mat_use_fwht(mm) && ggml_cuda_should_use_mmvf(src0, cc, warp_size, src1->ne[1]);
-    };
-    if (!takes_mmvf(mm1)) {
-        DEPTH_MIX_DECLINE("first product not MMVF");
+    if (!(mm1->type == GGML_TYPE_F32 && mm1->src[1]->type == GGML_TYPE_F32 && !ggml_cuda_op_mul_mat_use_fwht(mm1))) {
+        DEPTH_MIX_DECLINE("first product not F32");
     }
-    if (mm2 && !(takes_mmvf(mm2) && n % 2 == 0 && sm->nb[1] == n*sizeof(float))) {
+    if (mm2 && !(mm2->type == GGML_TYPE_F32 && sm->type == GGML_TYPE_F32 && sm->nb[1] == n*sizeof(float) && !ggml_cuda_op_mul_mat_use_fwht(mm2))) {
         // the second product stays a separate op
+        if (form_c) {
+            DEPTH_MIX_DECLINE("second product not F32");
+        }
         mm2 = nullptr;
         if (form_b) {
             cat_t = nullptr;
@@ -491,11 +515,11 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
             return a0 < b1 && b0 < a1;
         };
         const ggml_tensor * srcs[4] = { prev, prev_t ? prev_t : prev, q, rms };
-        bool rms_overlap_ok = true;
+        bool rms_overlap_ok = rms != nullptr;
         for (int k = 0; k < n_outs && rms_overlap_ok; ++k) {
             const ggml_tensor * o = cgraph->nodes[outs[k]];
             for (const ggml_tensor * src : srcs) {
-                if (!overlap(o, src)) {
+                if (!src || !overlap(o, src)) {
                     continue;
                 }
                 // a single token, or the mix output in the same per-token layout as the normed rows
@@ -509,7 +533,9 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     }
 
     depth_mix_params p = {};
-    p.normed = (const float *) rms->data;         p.normed_s2 = rms->nb[2] / sizeof(float);
+    if (rms) {
+        p.normed = (const float *) rms->data;     p.normed_s2 = rms->nb[2] / sizeof(float);
+    }
     p.prev = (const float *) prev->data;          p.prev_s1 = prev->nb[1] / sizeof(float);     p.prev_s2 = prev->nb[2] / sizeof(float);
     if (prev_t) {
         p.prev_t = (const float *) prev_t->data;  p.prev_t_s1 = prev_t->nb[1] / sizeof(float); p.prev_t_s2 = prev_t->nb[2] / sizeof(float);
@@ -569,12 +595,13 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     }
 
     const dim3 grid(nsplit, T, 1);
-    const size_t smem = ncols*sizeof(float);
+    const size_t smem = p.normed ? ncols*sizeof(float) : 0;
     const ggml_cuda_kernel_launch_params launch_params(grid, dim3(DEPTH_MIX_BLOCK, 1, 1), smem, ctx->stream());
     switch (nq) {
         case 1: ggml_cuda_kernel_launch(depth_mix_f32<1>, launch_params, p); break;
         case 2: ggml_cuda_kernel_launch(depth_mix_f32<2>, launch_params, p); break;
         case 3: ggml_cuda_kernel_launch(depth_mix_f32<3>, launch_params, p); break;
+        case 4: ggml_cuda_kernel_launch(depth_mix_f32<4>, launch_params, p); break;
         default: GGML_ABORT("fatal error");
     }
 
