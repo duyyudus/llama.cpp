@@ -888,6 +888,29 @@ void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct 
         }
     }
 
+    // batch host-to-device copies with one sync when set_tensor_n is supported
+    if (same_buft && buf->iface.set_tensor_n != NULL) {
+        bool all_host = true;
+        for (size_t i = 0; i < n_tensors; ++i) {
+            ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
+            if (srcs[i] == dsts[i] || src_buf == NULL || !ggml_backend_buffer_is_host(src_buf)) {
+                all_host = false;
+                break;
+            }
+        }
+        if (all_host) {
+            std::vector<const void *> data_ptrs(n_tensors);
+            std::vector<size_t> offsets(n_tensors, 0);
+            std::vector<size_t> sizes(n_tensors);
+            for (size_t i = 0; i < n_tensors; ++i) {
+                data_ptrs[i] = srcs[i]->data;
+                sizes[i]     = ggml_nbytes(srcs[i]);
+            }
+            buf->iface.set_tensor_n(buf, dsts, data_ptrs.data(), offsets.data(), sizes.data(), n_tensors);
+            return;
+        }
+    }
+
     if (!same_buft) {
         std::vector<std::vector<size_t>> groups;
         ggml_backend_tensor_buft_groups(n_tensors, [&](size_t i) {
@@ -2242,12 +2265,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        // batch host FLAG_INPUT copies so CUDA submits them with one stream sync instead of one per tensor
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        std::vector<const struct ggml_tensor *> host_inp_srcs;
+        std::vector<struct ggml_tensor *>       host_inp_dsts;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
-            if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
-                ggml_backend_sched_copy_input(sched, split, input);
+            if (ggml_backend_sched_is_host_weight(input) || !sched->hv_tensor_requires_copy[hash_id(input)]) {
+                continue;
             }
+            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
+                if (input_cpy != NULL && input != input_cpy && src_buf != NULL && ggml_backend_buffer_is_host(src_buf)) {
+                    host_inp_srcs.push_back(input);
+                    host_inp_dsts.push_back(input_cpy);
+                    continue;
+                }
+            }
+            ggml_backend_sched_copy_input(sched, split, input);
+        }
+        if (!host_inp_srcs.empty()) {
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            ggml_backend_tensor_copy_n(host_inp_srcs.data(), host_inp_dsts.data(), host_inp_srcs.size());
         }
         // after the copies above, which may read host memory reused by the copies of the next split
         // before the weights, whose copy callback may queue large uploads

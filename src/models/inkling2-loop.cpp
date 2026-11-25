@@ -87,6 +87,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     for (int il = 0; il < start; ++il) {
         res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
+        if (model.dev_layer(il) != model.dev_layer(il + 1)) {
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     // every pass starts from the prelude output
@@ -107,16 +110,26 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
-                continue;
+            } else {
+                const auto & loop = m.loop_layers[ip - start];
+                cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query, il), &loop);
             }
-            const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            const ggml_backend_dev_t next_dev = ip + 1 < end ? model.dev_layer(ip + 1)
+                : (pass + 1 < m.n_passes ? model.dev_layer(start)
+                : (end < m.n_phys ? model.dev_layer(end) : model.dev_output()));
+            if (model.dev_layer(il) != next_dev) {
+                ggml_build_forward_expand(gf, cur);
+            }
         }
     }
 
     for (int il = end; il < m.n_phys; ++il) {
         res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
+        const ggml_backend_dev_t next_dev = il + 1 < m.n_phys ? model.dev_layer(il + 1) : model.dev_output();
+        if (model.dev_layer(il) != next_dev) {
+            ggml_build_forward_expand(gf, cur);
+        }
     }
     GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
