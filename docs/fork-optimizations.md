@@ -1,4 +1,4 @@
-# Fork Optimizations Summary (`opt/2gpu-fast`)
+# Fork Optimizations Summary (`opt/inkling2-cuda-dual`)
 
 This document summarizes the performance, multi-GPU placement, and VRAM optimizations added in this fork on top of `849bf6392` (`unslothai/llama.cpp#433`).
 
