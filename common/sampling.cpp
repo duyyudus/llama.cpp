@@ -213,6 +213,7 @@ struct common_sampler * common_sampler_init(
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
     lparams.no_perf = params.no_perf;
+    lparams.skip_distributions = params.n_probs == 0;
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
@@ -624,8 +625,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -637,16 +636,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+            if (gsmpl->params.n_probs > 0) {
+                gsmpl->set_logits(ctx, idx);
+
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
                 }
             }
 
             return id;
         }
     }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

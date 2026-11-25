@@ -740,6 +740,7 @@ static bool llama_sampler_chain_backend_init(
     GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
 
     chain->is_init = true;
+    chain->skip_distributions = chain->params.skip_distributions && n_outputs_max_per_seq == 1;
 
     bool res = true;
     bool backend_prefix = true;
@@ -806,6 +807,12 @@ static void llama_sampler_chain_backend_apply(
         if (smpl.ptr->iface->backend_apply) {
             smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
         }
+    }
+
+    if (chain->skip_distributions && data->sampled != nullptr) {
+        data->logits     = nullptr;
+        data->probs      = nullptr;
+        data->candidates = nullptr;
     }
 }
 
@@ -874,6 +881,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .skip_distributions   = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},

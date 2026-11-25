@@ -15,6 +15,8 @@ struct llama_sampler_chain {
     // has .backend_init() been called?
     bool is_init = false;
 
+    bool skip_distributions = false;
+
     uint32_t n_nodes = 0;
 
     struct info {

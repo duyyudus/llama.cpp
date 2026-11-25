@@ -485,6 +485,7 @@ extern "C" {
 
     typedef struct llama_sampler_chain_params {
         bool no_perf; // whether to measure performance timings
+        bool skip_distributions; // skip copying full-vocab logits/probs/candidates when backend already sampled the token
     } llama_sampler_chain_params;
 
     // used in chat template
