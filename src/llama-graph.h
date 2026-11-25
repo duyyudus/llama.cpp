@@ -827,6 +827,8 @@ public:
     // [base, swa] I32 [n_kv] position of each cell (-1 if empty), when the banded attention takes the distances
     // from the positions: the cells of several sequences, or a wrapped cache. Null when the cells are the positions
     ggml_tensor * self_k_pos[2] = { nullptr, nullptr };
+    // scalar [1] I32 holding n_valid for maskless contiguous single-sequence decode on the base cache
+    ggml_tensor * self_n_kv_valid = nullptr;
     // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
     // banded ubatch, also when the cells are the positions (a check: the result must not change)
     int banded_pos = 0;

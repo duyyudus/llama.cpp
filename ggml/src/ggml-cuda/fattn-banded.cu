@@ -454,7 +454,7 @@ static __global__ void flash_attn_ext_banded_f32_merge(
 // mask loads of all its cells, then reduces K.Q in the group; one warp per row takes the softmax of the tile, and
 // each group accumulates P.V of its cells. The groups are merged at the end.
 static constexpr int fattn_banded_vec_threads = 128;
-static constexpr int fattn_banded_vec_cpg     = 8;   // cells per group and tile
+static constexpr int fattn_banded_vec_cpg     = 4;   // cells per group and tile
 
 // 8 consecutive K/V elements [d0, d0 + 8) of a row, loaded raw and converted on use
 template<ggml_type type> struct fattn_banded_kv8;
@@ -496,11 +496,18 @@ template<> struct fattn_banded_kv8<GGML_TYPE_Q8_0> {
         q[1] = uint32_t(qs[2]) | (uint32_t(qs[3]) << 16);
         d    = b->d;
     }
-    __device__ __forceinline__ void get(float (&x)[8]) const {
-        const float scale = __half2float(d);
+    __device__ __forceinline__ float scale() const { return __half2float(d); }
+    __device__ __forceinline__ void get_unscaled(float (&x)[8]) const {
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            x[j] = scale*float(int8_t((q[j/4] >> (8*(j % 4))) & 0xFF));
+            x[j] = float(int8_t((q[j/4] >> (8*(j % 4))) & 0xFF));
+        }
+    }
+    __device__ __forceinline__ void get(float (&x)[8]) const {
+        const float s = __half2float(d);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            x[j] = s*float(int8_t((q[j/4] >> (8*(j % 4))) & 0xFF));
         }
     }
 };
@@ -647,7 +654,7 @@ static __global__ void flash_attn_ext_banded_vec(
     __shared__ float alpha_s[NR];
     __shared__ float max_s[NR];
     __shared__ float sum_s[NR];
-    __shared__ float o_s[NG][NR][D + 1];
+    __shared__ float o_s[NG][D + 1];
 
     const int tid = threadIdx.x;
     const int t   = tid % T;
@@ -687,7 +694,8 @@ static __global__ void flash_attn_ext_banded_vec(
     const char * r_row = rel + uint64_t(ih_r[rt])*r_nb1 + uint64_t(iq_r[rt])*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3;
     // the cell the row's query is aligned to, or its position when the cells are not the positions
     const int32_t * kp = k_pos ? k_pos + ib*kpos_s1 : nullptr;
-    const int64_t q_pos = kp ? int64_t(q_pos_d[ib*qpos_s1 + iq_r[rt]]) : iq_r[rt] + (n_kv - n_q);
+    const int64_t n_valid = (!m_row && !kp && q_pos_d) ? min(int64_t(q_pos_d[0]), n_kv) : n_kv;
+    const int64_t q_pos = kp ? int64_t(q_pos_d[ib*qpos_s1 + iq_r[rt]]) : iq_r[rt] + (n_valid - n_q);
 
     if (tid < NR) {
         max_s[tid] = -INFINITY;
@@ -704,21 +712,19 @@ static __global__ void flash_attn_ext_banded_vec(
     __syncthreads();
 
     const int64_t c_begin = ic*chunk;
-    const int64_t c_end   = min(c_begin + chunk, n_kv);
+    const int64_t c_end   = min(c_begin + chunk, n_valid);
     const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
     const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
 
     for (int64_t c0 = c_begin; c0 < c_end; c0 += TC) {
-        // every load of the tile first: group grp takes cells grp, grp + NG, ...
+        // K and mask/bias loads of the tile: group grp takes cells grp, grp + NG, ...
         fattn_banded_kv8<type_k> kr[CPG];
-        fattn_banded_kv8<type_v> vr[CPG];
         float bm[CPG]; // lane t < NR: mask + bias of row t, -inf when masked
 #pragma unroll
         for (int j = 0; j < CPG; ++j) {
             const int64_t c  = c0 + grp + j*NG;
             const int64_t cc = c < c_end ? c : c_end - 1;
             kr[j].load(k_base + uint64_t(cc)*k_nb1, t*E);
-            vr[j].load(v_base + uint64_t(cc)*v_nb1, t*E);
             bm[j] = -INFINITY;
             if (t < NR && c < c_end) {
                 bm[j] = m_row ? __half2float(*(const half *) (m_row + uint64_t(c)*sizeof(half))) : 0.0f;
@@ -732,7 +738,11 @@ static __global__ void flash_attn_ext_banded_vec(
 #pragma unroll
         for (int j = 0; j < CPG; ++j) {
             float kx[E];
-            kr[j].get(kx);
+            if constexpr (type_k == GGML_TYPE_Q8_0) {
+                kr[j].get_unscaled(kx);
+            } else {
+                kr[j].get(kx);
+            }
             float sr[NR];
 #pragma unroll
             for (int r = 0; r < NR; ++r) {
@@ -740,6 +750,9 @@ static __global__ void flash_attn_ext_banded_vec(
 #pragma unroll
                 for (int e = 0; e < E; ++e) {
                     s += qv[r][e]*kx[e];
+                }
+                if constexpr (type_k == GGML_TYPE_Q8_0) {
+                    s *= kr[j].scale();
                 }
                 sr[r] = warp_reduce_sum<T>(s);
             }
@@ -787,6 +800,14 @@ static __global__ void flash_attn_ext_banded_vec(
         }
         __syncthreads();
 
+        // load V after softmax so K and V registers do not overlap, and issue V loads before rescaling o
+        fattn_banded_kv8<type_v> vr[CPG];
+#pragma unroll
+        for (int j = 0; j < CPG; ++j) {
+            const int64_t c  = c0 + grp + j*NG;
+            const int64_t cc = c < c_end ? c : c_end - 1;
+            vr[j].load(v_base + uint64_t(cc)*v_nb1, t*E);
+        }
         // P.V of the group's cells
 #pragma unroll
         for (int r = 0; r < NR; ++r) {
@@ -799,59 +820,72 @@ static __global__ void flash_attn_ext_banded_vec(
 #pragma unroll
         for (int j = 0; j < CPG; ++j) {
             float vx[E];
-            vr[j].get(vx);
+            if constexpr (type_v == GGML_TYPE_Q8_0) {
+                vr[j].get_unscaled(vx);
+            } else {
+                vr[j].get(vx);
+            }
 #pragma unroll
             for (int r = 0; r < NR; ++r) {
-                const float p = S[grp + j*NG][r];
+                float p = S[grp + j*NG][r];
+                if constexpr (type_v == GGML_TYPE_Q8_0) {
+                    p *= vr[j].scale();
+                }
 #pragma unroll
                 for (int e = 0; e < E; ++e) {
                     o[r][e] += p*vx[e];
                 }
             }
         }
-        __syncthreads();
+        // each group owns disjoint S[grp + j*NG] slots inside one warp; syncwarp suffices before next tile K.Q
+        ggml_cuda_syncwarp();
     }
 
-    // merge the groups
+    // merge the groups one row at a time to keep shared memory small for high occupancy
 #pragma unroll
     for (int r = 0; r < NR; ++r) {
+        if (r >= n_rows) {
+            break;
+        }
+        if (r > 0) {
+            __syncthreads();
+        }
 #pragma unroll
         for (int e = 0; e < E; ++e) {
-            o_s[grp][r][t*E + e] = o[r][e];
+            o_s[grp][t*E + e] = o[r][e];
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int idx = tid; idx < n_rows*D; idx += NT) {
-        const int r = idx / D;
-        const int d = idx % D;
-        float acc = 0.0f;
+        if (tid < D) {
+            const int d = tid;
+            float acc = 0.0f;
 #pragma unroll
-        for (int g = 0; g < NG; ++g) {
-            acc += o_s[g][r][d];
-        }
-        const float m  = max_s[r];
-        float       l  = sum_s[r];
-        const int f   = rb*NR + r;
-        const int iqr = f / G;
-        const int ihr = ih_kv*G + f % G;
-        const int64_t row = (int64_t(ib)*n_q + iqr)*n_head_q + ihr;
-        if (n_chunks == 1) {
-            float fs = 1.0f;
-            if (sinks) {
-                const float sink  = sinks[ihr + iqr*sinks_s1 + ib*sinks_s2];
-                const float m_new = fmaxf(m, sink);
-                fs = expf(m - m_new);
-                l  = l*fs + expf(sink - m_new);
+            for (int g = 0; g < NG; ++g) {
+                acc += o_s[g][d];
             }
-            dst[row*D + d] = l == 0.0f ? 0.0f : acc*fs/l;
-        } else {
-            float * p = part + (row*n_chunks + ic)*(D + 2);
-            if (d == 0) {
-                p[0] = m;
-                p[1] = l;
+            const float m  = max_s[r];
+            float       l  = sum_s[r];
+            const int f   = rb*NR + r;
+            const int iqr = f / G;
+            const int ihr = ih_kv*G + f % G;
+            const int64_t row = (int64_t(ib)*n_q + iqr)*n_head_q + ihr;
+            if (n_chunks == 1) {
+                float fs = 1.0f;
+                if (sinks) {
+                    const float sink  = sinks[ihr + iqr*sinks_s1 + ib*sinks_s2];
+                    const float m_new = fmaxf(m, sink);
+                    fs = expf(m - m_new);
+                    l  = l*fs + expf(sink - m_new);
+                }
+                dst[row*D + d] = l == 0.0f ? 0.0f : acc*fs/l;
+            } else {
+                float * p = part + (row*n_chunks + ic)*(D + 2);
+                if (d == 0) {
+                    p[0] = m;
+                    p[1] = l;
+                }
+                p[2 + d] = acc;
             }
-            p[2 + d] = acc;
         }
     }
 }
@@ -982,7 +1016,9 @@ static bool fattn_banded_vec_usable(const ggml_tensor * dst) {
     return q->nb[1] % 16 == 0 && q->nb[2] % 16 == 0 && q->nb[3] % 16 == 0 && (uintptr_t) q->data % 16 == 0;
 }
 
-static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+template<int D, int NR, ggml_type type_k, ggml_type type_v>
+static void fattn_banded_vec_launch_t(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -991,22 +1027,20 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * rel   = dst->src[6];
     cudaStream_t stream = ctx.stream();
 
-    const int64_t D    = q->ne[0];
     const int64_t n_q  = q->ne[1];
     const int64_t n_kv = k->ne[1];
     const int64_t G    = q->ne[2]/k->ne[2];
-    // rows per block: the GQA groups of as many queries as fit 8 rows (one query: its group alone), else 8
-    // (Q heads of a KV head in steps of 8)
-    const int     NR   = G > 8 ? 8 : int(G*std::min<int64_t>(n_q, 8/G));
     const int64_t n_rb = (n_q*G + NR - 1)/NR;
 
-    // split the cells so that the grid fills the GPU
-    constexpr int64_t tile      = fattn_banded_vec_threads/16*fattn_banded_vec_cpg; // D = 128
-    constexpr int64_t min_chunk = 4*tile;
-    const int64_t base_blocks = k->ne[2]*n_rb*q->ne[3];
-    // one wave of resident blocks, 3 per SM
-    const int64_t target      = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*3;
-    int64_t n_chunks = std::max<int64_t>(1, std::min<int64_t>(target/base_blocks, (n_kv + min_chunk - 1)/min_chunk));
+    // split cells to fill one full wave at this kernel's real occupancy without a tail wave
+    int occ = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, flash_attn_ext_banded_vec<D, NR, type_k, type_v>, fattn_banded_vec_threads, 0));
+    constexpr int64_t tile      = (fattn_banded_vec_threads/(D/8))*fattn_banded_vec_cpg;
+    constexpr int64_t min_chunk = tile*4 > 256 ? tile*4 : 256;
+    const int64_t base_blocks   = k->ne[2]*n_rb*q->ne[3];
+    const int64_t resident      = int64_t(std::max(occ, 1))*ggml_cuda_info().devices[ctx.device].nsm;
+    int64_t n_chunks = std::max<int64_t>(1, std::min<int64_t>(resident/base_blocks, (n_kv + min_chunk - 1)/min_chunk));
     n_chunks = std::min<int64_t>(n_chunks, 4096); // merge weights in shared memory
     const int64_t chunk = GGML_PAD((n_kv + n_chunks - 1)/n_chunks, tile);
     n_chunks = (n_kv + chunk - 1)/chunk;
@@ -1028,15 +1062,37 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t qpos_s1 = q_pos && q_pos->ne[1] > 1 ? q_pos->ne[0] : 0;
 
     const dim3 blocks(k->ne[2], n_chunks, n_rb*q->ne[3]);
+    flash_attn_ext_banded_vec<D, NR, type_k, type_v><<<blocks, fattn_banded_vec_threads, 0, stream>>>(
+        (const char *) q->data, (const char *) k->data, (const char *) v->data, m ? (const char *) m->data : nullptr,
+        (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(),
+        scale, rel->type, int(n_q), n_kv, int(q->ne[2]), int(k->ne[2]), n_chunks, chunk, rel_extent,
+        m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], k->nb[1], k->nb[2], k->nb[3],
+        v->nb[1], v->nb[2], v->nb[3], m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0,
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2,
+        k_pos_d, q_pos_d, kpos_s1, qpos_s1);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (n_chunks > 1) {
+        const size_t smem = n_chunks*sizeof(float);
+        flash_attn_ext_banded_vec_merge<D><<<n_rows, 128, smem, stream>>>(
+            part.get(), (float *) dst->data, q->ne[2], n_q, int(n_chunks), sinks_d, sinks_s1, sinks_s2);
+    }
+}
+
+static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    const int64_t D   = q->ne[0];
+    const int64_t n_q = q->ne[1];
+    const int64_t G   = q->ne[2]/k->ne[2];
+    // rows per block: the GQA groups of as many queries as fit 8 rows (one query: its group alone), else 8
+    // (Q heads of a KV head in steps of 8)
+    const int     NR  = G > 8 ? 8 : int(G*std::min<int64_t>(n_q, 8/G));
+
 #define LAUNCH_BANDED_VEC_T(DD, NRR, TK, TV) \
-    flash_attn_ext_banded_vec<DD, NRR, TK, TV><<<blocks, fattn_banded_vec_threads, 0, stream>>>( \
-        (const char *) q->data, (const char *) k->data, (const char *) v->data, m ? (const char *) m->data : nullptr, \
-        (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(), \
-        scale, rel->type, int(n_q), n_kv, int(q->ne[2]), int(k->ne[2]), n_chunks, chunk, rel_extent, \
-        m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], k->nb[1], k->nb[2], k->nb[3], \
-        v->nb[1], v->nb[2], v->nb[3], m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, \
-        k_pos_d, q_pos_d, kpos_s1, qpos_s1)
+    fattn_banded_vec_launch_t<DD, NRR, TK, TV>(ctx, dst, scale, rel_extent)
 #define LAUNCH_BANDED_VEC_NR(DD, TK, TV) \
     switch (NR) { \
         case 1:  LAUNCH_BANDED_VEC_T(DD, 1, TK, TV); break; \
@@ -1073,18 +1129,6 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
 #undef LAUNCH_BANDED_VEC_NR
 #undef LAUNCH_BANDED_VEC_SAME
 #undef LAUNCH_BANDED_VEC_T
-    CUDA_CHECK(cudaGetLastError());
-
-    if (n_chunks > 1) {
-        const size_t smem = n_chunks*sizeof(float);
-        if (D == 64) {
-            flash_attn_ext_banded_vec_merge<64><<<n_rows, 128, smem, stream>>>(
-                part.get(), (float *) dst->data, q->ne[2], n_q, int(n_chunks), sinks_d, sinks_s1, sinks_s2);
-        } else {
-            flash_attn_ext_banded_vec_merge<128><<<n_rows, 128, smem, stream>>>(
-                part.get(), (float *) dst->data, q->ne[2], n_q, int(n_chunks), sinks_d, sinks_s1, sinks_s2);
-        }
-    }
 }
 
 #if defined(TURING_MMA_AVAILABLE)
@@ -1586,6 +1630,19 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         return false;
     }
 
+    // maskless scalar n_valid mode runs only in the decode vector kernel; validate alignment on the real K/V types before F16 check
+    if (!dst->src[7] && dst->src[8]) {
+        const ggml_tensor * q     = dst->src[0];
+        const ggml_tensor * m     = dst->src[3];
+        const ggml_tensor * q_pos = dst->src[8];
+        if (!q || m != nullptr || q->ne[1] != 1 || q->ne[3] != 1 ||
+                q_pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(q_pos) ||
+                q_pos->ne[0] != 1 || q_pos->ne[1] != 1 || q_pos->ne[2] != 1 || q_pos->ne[3] != 1 ||
+                !fattn_banded_vec_usable(dst)) {
+            return false;
+        }
+    }
+
     // quantized K/V are read as F16: check the op with F16 K/V of the same shape
     if (dst->src[1] && dst->src[2] &&
         (fattn_banded_kv_f16_convertible(dst->src[1]->type) || fattn_banded_kv_f16_convertible(dst->src[2]->type))) {
@@ -1603,6 +1660,9 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         }
         op.src[1] = &k16;
         op.src[2] = &v16;
+        if (!op.src[7] && op.src[8]) {
+            op.src[8] = nullptr;
+        }
         return ggml_cuda_flash_attn_ext_banded_supported(device, &op);
     }
 
@@ -1645,7 +1705,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     const ggml_tensor * k_pos = dst->src[7];
     const ggml_tensor * q_pos = dst->src[8];
-    if ((k_pos == nullptr) != (q_pos == nullptr)) {
+    if (k_pos && !q_pos) {
         return false;
     }
     if (k_pos && (k_pos->type != GGML_TYPE_I32 || q_pos->type != GGML_TYPE_I32 ||

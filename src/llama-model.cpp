@@ -1960,9 +1960,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (loop_core_range(loop_start, loop_end, loop_passes) &&
             loop_start >= 0 && loop_start < loop_end && loop_end <= n_layer_weights) {
             std::vector<size_t> rank_bytes(n_layer_weights + 1, 0);
+            int64_t n_vocab_out = 0;
             for (const auto & [name, weight] : ml.weights_map) {
                 if (name == "token_embd.weight") {
+                    if (n_vocab_out == 0) {
+                        n_vocab_out = weight.tensor->ne[1];
+                    }
                     continue;
+                }
+                if (name == "output.weight") {
+                    n_vocab_out = weight.tensor->ne[1];
                 }
                 int bid = -1;
                 const int ir = (sscanf(name.c_str(), "blk.%d.", &bid) == 1 && bid >= 0 && bid < n_layer_weights) ? bid : n_layer_weights;
@@ -2009,25 +2016,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (loop_start > 0 && bytes_core + bytes_post <= primary_kv_cap(primary) && bytes_pre <= dev_cap(secondary)) {
                     assign_split(loop_start, secondary, primary, "prelude offloaded");
                 } else if (loop_start > 0 && bytes_core <= primary_kv_cap(primary)) {
-                    // keep looped core intact on primary and spill just enough postlude tail to secondary for KV + WDDM headroom
+                    // keep looped core (and lm_head when it fits) on primary, spilling postlude blocks to secondary for KV + WDDM headroom
                     const size_t cap_pri = primary_kv_cap(primary);
                     const size_t cap_sec = dev_cap(secondary);
+                    const size_t bytes_out = rank_bytes[n_layer_weights];
+                    // keeping lm_head on primary also places the pp logits compute buffers there
+                    const size_t out_compute_est = (size_t) std::max<int64_t>(n_vocab_out, 0) * 512 * sizeof(float) * 2;
+                    const size_t cap_pri_out = cap_pri > out_compute_est ? cap_pri - out_compute_est : 0;
+                    const bool keep_output_pri = bytes_core + bytes_out <= cap_pri_out;
+                    const size_t target_pri = keep_output_pri ? cap_pri_out : cap_pri;
                     size_t used_pri = bytes_core + bytes_post;
                     size_t used_sec = bytes_pre;
-                    int cut_post = n_layer_weights + 1;
-                    while (cut_post > loop_end && used_pri > cap_pri) {
+                    int cut_post = keep_output_pri ? n_layer_weights : n_layer_weights + 1;
+                    while (cut_post > loop_end && used_pri > target_pri) {
                         --cut_post;
                         used_pri -= rank_bytes[cut_post];
                         used_sec += rank_bytes[cut_post];
                     }
-                    if (used_pri <= cap_pri && used_sec <= cap_sec) {
+                    if (used_pri <= target_pri && used_sec <= cap_sec) {
                         for (int ir = 0; ir <= n_layer_weights; ++ir) {
-                            const size_t d = (ir >= loop_start && ir < cut_post) ? primary : secondary;
-                            rank_dev[ir] = devices[d].dev;
+                            const bool on_pri = (ir >= loop_start && ir < cut_post) || (keep_output_pri && ir == n_layer_weights);
+                            rank_dev[ir] = devices[on_pri ? primary : secondary].dev;
                         }
                         use_custom_layout = true;
-                        LLAMA_LOG_INFO("%s: loop-aware split (prelude + postlude tail offloaded): [%d, %d) -> %s (%.1f MiB), rest -> %s (%.1f MiB)\n",
-                                fn, loop_start, cut_post, ggml_backend_dev_name(devices[primary].dev), used_pri / (1024.0 * 1024.0),
+                        LLAMA_LOG_INFO("%s: loop-aware split (prelude + postlude tail offloaded): [%d, %d)%s -> %s (%.1f MiB), rest -> %s (%.1f MiB)\n",
+                                fn, loop_start, cut_post, keep_output_pri ? " + output" : "",
+                                ggml_backend_dev_name(devices[primary].dev), used_pri / (1024.0 * 1024.0),
                                 ggml_backend_dev_name(devices[secondary].dev), used_sec / (1024.0 * 1024.0));
                     }
                 }

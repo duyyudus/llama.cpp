@@ -1424,6 +1424,11 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         }
     }
 
+    if (self_n_kv_valid && self_n_kv_valid->buffer) {
+        const int32_t n_valid = (int32_t) attn_ctx->get_base()->get_n_kv_pos_contiguous();
+        ggml_backend_tensor_set(self_n_kv_valid, &n_valid, 0, sizeof(n_valid));
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1530,6 +1535,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
                 get_n_kv_banded(i ? attn_ctx->get_swa() : attn_ctx->get_base(), params.ubatch, use_pos);
             res &= n == n_kv_banded[i];
             res &= use_pos == (self_k_pos[i] != nullptr);
+        }
+        if (self_n_kv_valid) {
+            const uint32_t n_used = params.ubatch.n_seqs_unq == 1 ? attn_ctx->get_base()->get_n_kv_pos_contiguous() : 0;
+            res &= params.cparams.causal_attn && params.ubatch.n_tokens == 1 && params.ubatch.pos != nullptr &&
+                n_used > 0 && n_used == (uint32_t) params.ubatch.pos[0] + 1;
         }
     }
 

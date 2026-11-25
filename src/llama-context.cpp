@@ -1095,7 +1095,45 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+void llama_context::fetch_deferred_logits(int64_t row) {
+    if (logits_dev_tensor == nullptr || logits.data == nullptr) {
+        return;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (row >= 0) {
+        if (row < logits_dev_row_start || row >= logits_dev_row_start + logits_dev_n_rows) {
+            return;
+        }
+        const int64_t rel = row - logits_dev_row_start;
+        if (!logits_dev_fetched[rel]) {
+            synchronize();
+            ggml_backend_tensor_get(logits_dev_tensor,
+                    logits.data + row*n_vocab, rel*n_vocab*sizeof(float), n_vocab*sizeof(float));
+            logits_dev_fetched[rel] = true;
+        }
+        return;
+    }
+
+    bool synced = false;
+    for (int64_t rel = 0; rel < logits_dev_n_rows; ++rel) {
+        if (logits_dev_fetched[rel]) {
+            continue;
+        }
+        if (!synced) {
+            synchronize();
+            synced = true;
+        }
+        const int64_t j = logits_dev_row_start + rel;
+        ggml_backend_tensor_get(logits_dev_tensor,
+                logits.data + j*n_vocab, rel*n_vocab*sizeof(float), n_vocab*sizeof(float));
+        logits_dev_fetched[rel] = true;
+    }
+    logits_dev_tensor = nullptr;
+}
+
 float * llama_context::get_logits() {
+    fetch_deferred_logits();
     output_reorder();
 
     return logits.data;
@@ -1139,6 +1177,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        fetch_deferred_logits(j);
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -1854,6 +1893,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+    logits_dev_tensor = nullptr;
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -2396,6 +2436,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        if (logits_dev_tensor != nullptr) {
+            // next ubatch will overwrite t_logits on device, so flush any prior ubatch's deferred logits first
+            fetch_deferred_logits();
+        }
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -2445,17 +2490,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
-            GGML_ASSERT(logits.data != nullptr);
+        if (logits.data && t_logits && n_outputs > 0) {
+            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
-
-            if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+            if (needs_raw_logits(ubatch, sampling.samplers)) {
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+                GGML_ASSERT(backend_res != nullptr);
+                float * logits_out = logits.data + n_outputs_prev*n_vocab;
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                logits_dev_tensor = nullptr;
+            } else {
+                logits_dev_tensor    = t_logits;
+                logits_dev_row_start = n_outputs_prev;
+                logits_dev_n_rows    = n_outputs;
+                logits_dev_fetched.assign(n_outputs, false);
             }
         }
 
@@ -2653,6 +2702,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, bool sampled_ids, bool
     const auto & vocab   = model.vocab;
 
     sampling.outputs_ready = false;
+    logits_dev_tensor      = nullptr;
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
 
     const auto n_batch    = cparams.n_batch;
@@ -2856,6 +2906,10 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    if (!output_swaps.empty() && logits_dev_tensor != nullptr) {
+        fetch_deferred_logits();
+    }
+
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
@@ -3043,6 +3097,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+    logits_dev_tensor = nullptr;
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {

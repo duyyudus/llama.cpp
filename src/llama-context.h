@@ -252,6 +252,9 @@ private:
 
     void output_reorder();
 
+    // lazily copy deferred device logits to host when a caller needs raw logits (e.g. grammar rejection)
+    void fetch_deferred_logits(int64_t row = -1);
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -349,6 +352,12 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // deferred device logits when backend sampling skips raw logits D2H
+    const ggml_tensor * logits_dev_tensor    = nullptr;
+    int64_t             logits_dev_row_start = 0;
+    int64_t             logits_dev_n_rows    = 0;
+    std::vector<bool>   logits_dev_fetched;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
