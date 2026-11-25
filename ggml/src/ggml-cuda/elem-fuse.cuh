@@ -76,3 +76,7 @@ struct ggml_cuda_row_norm_div_match {
 int ggml_cuda_match_row_norm_div(const ggml_cgraph * cgraph, int i, ggml_cuda_row_norm_div_match & match);
 
 void ggml_cuda_op_row_norm_div(ggml_backend_cuda_context & ctx, const ggml_cuda_row_norm_div_match & match);
+
+// F32 matmul for small K (K <= 64, K % 4 == 0) and small N (4 <= N <= 32), avoids cuBLAS split-K overhead
+bool ggml_cuda_try_mul_mat_f32_small_k(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

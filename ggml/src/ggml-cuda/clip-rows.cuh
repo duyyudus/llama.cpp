@@ -12,4 +12,10 @@
 // x, w, limit and dst are contiguous F32; x is [ncols, nrows], w is [ncols, w_rows] (row r reads row r % w_rows),
 // limit (if not null) holds one value per row.
 void ggml_cuda_op_clip_rows_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
-        const ggml_tensor * limit, float limit_value, float bias, float lo, float hi, ggml_tensor * dst);
+        const ggml_tensor * limit, float limit_value, float bias, float lo, float hi,
+        const ggml_tensor * tau, ggml_tensor * dst);
+
+// Fused row L2 clip + optional per-token tau scale + FWHT(128) + optional Q8_0 set_rows scatter.
+void ggml_cuda_op_clip_rows_fwht_128(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+        const ggml_tensor * limit, float limit_value, float bias, float lo, float hi,
+        const ggml_tensor * tau, ggml_tensor * dst, const ggml_tensor * set_rows_idxs);

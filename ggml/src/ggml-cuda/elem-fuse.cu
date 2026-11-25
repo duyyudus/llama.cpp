@@ -800,3 +800,104 @@ void ggml_cuda_op_row_norm_div(ggml_backend_cuda_context & ctx, const ggml_cuda_
         match.has_scale ? launch(row_norm_div_f32<false, true>) : launch(row_norm_div_f32<false, false>);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// F32 small-K small-N matmul: 64 rows x 4 cols per block, loads 4 cols of B into shared memory once
+
+static __global__ void mul_mat_f32_small_k(
+        const float4 * __restrict__ a_ptr, const float4 * __restrict__ b_ptr, float * __restrict__ dst_ptr,
+        const int K4, const int M, const int N,
+        const int64_t a_s2_4, const int64_t a_s3_4,
+        const int64_t b_s1_4, const int64_t b_s2_4, const int64_t b_s3_4,
+        const int64_t dst_s1, const int64_t dst_s2, const int64_t dst_s3,
+        const int ne02, const int ne03, const int ne12) {
+    ggml_cuda_pdl_lc();
+    __shared__ float4 sb[4 * 16];
+
+    const int tid = threadIdx.x;
+    const int m   = blockIdx.x * 64 + tid;
+    const int n0  = blockIdx.y * 4;
+    const int i3  = blockIdx.z / ne12;
+    const int i2  = blockIdx.z % ne12;
+    const int i02 = ne02 == 1 ? 0 : i2;
+    const int i03 = ne03 == 1 ? 0 : i3;
+    const int nc  = min(4, N - n0);
+
+    const float4 * b_base = b_ptr + i3*b_s3_4 + i2*b_s2_4 + int64_t(n0)*b_s1_4;
+    ggml_cuda_pdl_sync();
+    if (tid < nc * K4) {
+        const int c = tid / K4;
+        const int k = tid % K4;
+        sb[c * K4 + k] = b_base[int64_t(c) * b_s1_4 + k];
+    }
+    __syncthreads();
+
+    if (m >= M) {
+        return;
+    }
+
+    const float4 * a_row = a_ptr + i03*a_s3_4 + i02*a_s2_4 + int64_t(m)*K4;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (int k = 0; k < K4; ++k) {
+        const float4 av = a_row[k];
+        const float4 b0 = sb[0 * K4 + k];
+        acc0 += av.x*b0.x + av.y*b0.y + av.z*b0.z + av.w*b0.w;
+        if (nc > 1) {
+            const float4 b1 = sb[1 * K4 + k];
+            acc1 += av.x*b1.x + av.y*b1.y + av.z*b1.z + av.w*b1.w;
+        }
+        if (nc > 2) {
+            const float4 b2 = sb[2 * K4 + k];
+            acc2 += av.x*b2.x + av.y*b2.y + av.z*b2.z + av.w*b2.w;
+        }
+        if (nc > 3) {
+            const float4 b3 = sb[3 * K4 + k];
+            acc3 += av.x*b3.x + av.y*b3.y + av.z*b3.z + av.w*b3.w;
+        }
+    }
+
+    float * dst_base = dst_ptr + i3*dst_s3 + i2*dst_s2 + int64_t(n0)*dst_s1 + m;
+    dst_base[0] = acc0;
+    if (nc > 1) { dst_base[1 * dst_s1] = acc1; }
+    if (nc > 2) { dst_base[2 * dst_s1] = acc2; }
+    if (nc > 3) { dst_base[3 * dst_s1] = acc3; }
+}
+
+bool ggml_cuda_try_mul_mat_f32_small_k(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    if (K <= 0 || K > 64 || (K % 4) != 0 || M < 64 || M > INT_MAX || N < 4 || N > 32) {
+        return false;
+    }
+    if ((src0->ne[2] != 1 && src0->ne[2] != src1->ne[2]) ||
+        (src0->ne[3] != 1 && src0->ne[3] != src1->ne[3]) ||
+        src1->ne[2] * src1->ne[3] > 8) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) ||
+        src1->nb[0] != sizeof(float) || (src1->nb[1] % 16) != 0 || (src1->nb[2] % 16) != 0 || (src1->nb[3] % 16) != 0 ||
+        ((uintptr_t) src0->data & 15) != 0 || ((uintptr_t) src1->data & 15) != 0) {
+        return false;
+    }
+
+    const int K4 = (int) (K / 4);
+    const dim3 grid((M + 63) / 64, (N + 3) / 4, (int) (src1->ne[2] * src1->ne[3]));
+    const dim3 block(64, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(grid, block, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_mat_f32_small_k, launch_params,
+        (const float4 *) src0->data, (const float4 *) src1->data, (float *) dst->data,
+        K4, (int) M, (int) N,
+        (int64_t) (src0->nb[2] / 16), (int64_t) (src0->nb[3] / 16),
+        (int64_t) (src1->nb[1] / 16), (int64_t) (src1->nb[2] / 16), (int64_t) (src1->nb[3] / 16),
+        (int64_t) (dst->nb[1] / sizeof(float)), (int64_t) (dst->nb[2] / sizeof(float)), (int64_t) (dst->nb[3] / sizeof(float)),
+        (int) src0->ne[2], (int) src0->ne[3], (int) src1->ne[2]);
+    return true;
+}

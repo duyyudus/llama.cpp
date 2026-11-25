@@ -13,6 +13,30 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
 #endif
 }
 
+template <int block_size>
+static __global__ void mul_mat_vec_f32_vec4(
+        const float4 * __restrict__ x_ptr, const float4 * __restrict__ y_ptr, float * __restrict__ dst_ptr,
+        const int K4, const int64_t stride_row4) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float s_sum[32];
+
+    const float4 * x4 = x_ptr + int64_t(row) * stride_row4;
+    ggml_cuda_pdl_sync();
+    float sum = 0.0f;
+    for (int c = tid; c < K4; c += block_size) {
+        const float4 xv = x4[c];
+        const float4 yv = y_ptr[c];
+        sum += xv.x*yv.x + xv.y*yv.y + xv.z*yv.z + xv.w*yv.w;
+    }
+
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    if (tid == 0) {
+        dst_ptr[row] = sum;
+    }
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -508,6 +532,20 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    // Wide float4 path for few-row, long-K F32 matvec (e.g. MoE router) on larger GPUs.
+    if constexpr (std::is_same_v<T, float> && ncols_dst == 1 && !is_multi_token_id) {
+        if (!has_fusion && !ids && nchannels_dst == 1 && nsamples_dst == 1 &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].nsm >= 48 &&
+            nrows <= 256 && ncols >= 1024 && (ncols % 4) == 0 && (stride_row % 4) == 0 &&
+            ((uintptr_t) x & 15) == 0 && ((uintptr_t) y & 15) == 0) {
+            constexpr int block_size = 512;
+            const ggml_cuda_kernel_launch_params launch_params(dim3(nrows, 1, 1), dim3(block_size, 1, 1), 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_f32_vec4<block_size>, launch_params,
+                (const float4 *) x, (const float4 *) y, dst, (int) (ncols / 4), (int64_t) (stride_row / 4));
+            return;
+        }
+    }
 
     // short rows (one warp each): pack several rows per block, each warp computes its row exactly as a single-warp block
     int64_t rows_per_block = 1;

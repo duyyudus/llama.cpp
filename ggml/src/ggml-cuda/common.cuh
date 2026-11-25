@@ -1550,6 +1550,22 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// read-only lookup in src1_cache: never allocates or frees on the pool, safe when callers hold pool allocations
+static inline void * ggml_cuda_src1_cache_peek(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t nbytes, bool * hit) {
+    ggml_cuda_src1_cache & c = ctx.src1_cache;
+    *hit = false;
+    if (!c.enabled || !c.ptr || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (c.src1 == src1 && c.data == src1->data && c.layout == layout && c.size >= nbytes && c.pool == &ctx.pool() &&
+            memcmp(c.ne, src1->ne, sizeof(c.ne)) == 0 && memcmp(c.nb, src1->nb, sizeof(c.nb)) == 0) {
+        *hit = true;
+        c.n_hit++;
+        return c.ptr;
+    }
+    return nullptr;
+}
+
 // the buffer for src1 quantized with `layout` (nbytes or more) when the src1 cache is on, else nullptr;
 // *hit is set when the buffer already holds src1 in that layout, so that the quantization can be skipped
 static inline void * ggml_cuda_src1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t nbytes, bool * hit) {

@@ -2580,7 +2580,6 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> block_stacks;
         // the rows of each mix, the stack of its blocks and its current input last
         std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> mix_states;
-        std::map<ggml_tensor *, ggml_tensor *> view_3d;
         const block_stack * stack(const std::vector<ggml_tensor *> & blocks, int il);
 
         // the clip thresholds, per layer device, row count and threshold (and the zero sinks, keyed by -n_head)

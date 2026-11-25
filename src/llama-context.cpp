@@ -3328,10 +3328,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.n_layer_weights();
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
-                const auto & dev_layer = model.dev_layer(il);
+            const bool pin_layer  = il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "res_norm") == 0);
+            const bool pin_output = il == -1 && strcmp(name, "res_norm") == 0;
+            if (pin_layer || pin_output) {
+                const auto & target_dev = pin_output ? model.dev_output() : model.dev_layer(il);
                 for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    if (ggml_backend_get_device(backend.get()) == target_dev) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }

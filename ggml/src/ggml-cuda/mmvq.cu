@@ -742,12 +742,10 @@ static __global__ void mul_mat_vec_q(
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
-    bool use_scale = false;
     bool use_gate_scale = false;
     [[maybe_unused]] const void * vgate = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
-    const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
     ggml_glu_op active_glu;
     float glu_limit = 0.0f;
@@ -762,9 +760,7 @@ static __global__ void mul_mat_vec_q(
         active_glu    = fusion.glu_op;
         glu_limit     = fusion.glu_limit;
         if constexpr (type == GGML_TYPE_NVFP4) {
-            use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
-            x_scale        = (const float *) fusion.x_scale;
             gate_scale     = (const float *) fusion.gate_scale;
         }
     }
@@ -772,7 +768,6 @@ static __global__ void mul_mat_vec_q(
 
     [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
-    [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
     if constexpr (has_fusion) {
         // 1. Hide latency by prefetching bias, gates and scales here
@@ -795,9 +790,6 @@ static __global__ void mul_mat_vec_q(
                 }
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
-                if (use_scale) {
-                    x_scales = x_scale[ids ? channel_x : 0];
-                }
                 if (use_gate_scale) {
                     gate_scales = gate_scale[ids ? channel_x : 0];
                 }
@@ -902,10 +894,12 @@ static __global__ void mul_mat_vec_q(
 
             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
                 float result = tmp[j][i];
-                if constexpr (has_fusion) {
-                    if constexpr (type == GGML_TYPE_NVFP4) {
-                        result *= x_scales;
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    if (fusion.x_scale != nullptr) {
+                        result *= ((const float *) fusion.x_scale)[ids ? channel_x : 0];
                     }
+                }
+                if constexpr (has_fusion) {
                     result += x_biases[j];
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
@@ -938,10 +932,10 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, gate_scale, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
-        GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+        GGML_UNUSED_VARS(use_gate_scale, gate_scale, gate_scales);
     }
 }
 
@@ -982,7 +976,6 @@ static __global__ void mul_mat_vec_q_moe(
     const void  * vgate      = nullptr;
     const float * x_bias     = nullptr;
     const float * gate_bias  = nullptr;
-    const float * x_scale    = nullptr;
     const float * gate_scale = nullptr;
     ggml_glu_op   active_glu = GGML_GLU_OP_SWIGLU;
     float         glu_limit  = 0.0f;
@@ -995,7 +988,6 @@ static __global__ void mul_mat_vec_q_moe(
         active_glu = fusion.glu_op;
         glu_limit  = fusion.glu_limit;
         if constexpr (type == GGML_TYPE_NVFP4) {
-            x_scale    = (const float *) fusion.x_scale;
             gate_scale = (const float *) fusion.gate_scale;
         }
     }
@@ -1053,14 +1045,14 @@ static __global__ void mul_mat_vec_q_moe(
     // Write results
     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
         float result = tmp[threadIdx.x];
+        if constexpr (type == GGML_TYPE_NVFP4) {
+            if (fusion.x_scale != nullptr) {
+                result *= ((const float *) fusion.x_scale)[channel_x];
+            }
+        }
         if constexpr (has_fusion) {
             const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
 
-            if constexpr (type == GGML_TYPE_NVFP4) {
-                if (x_scale) {
-                    result *= x_scale[channel_x];
-                }
-            }
             if (x_bias) {
                 result += x_bias[bias_idx];
             }
@@ -1097,10 +1089,95 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
+        GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, gate_scale);
     } else if constexpr (type != GGML_TYPE_NVFP4) {
-        GGML_UNUSED_VARS(x_scale, gate_scale);
+        GGML_UNUSED(gate_scale);
     }
+}
+
+// Independent-warp ncols_dst == 1 kernel: each warp computes c_rows_per_warp rows with no shared memory or __syncthreads.
+template <ggml_type type, int c_rows_per_warp>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_warp(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const uint32_t row0 = c_rows_per_warp * (blockIdx.x * blockDim.y + threadIdx.y);
+    if (row0 >= nrows_x) {
+        return;
+    }
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+
+    ggml_cuda_pdl_sync();
+    const uint32_t channel_x = ids ? ids[channel_dst]                  : fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    const uint32_t sample_x  = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y  = sample_dst;
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int64_t kbx_offset = int64_t(sample_x)*stride_sample_x + int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row_x;
+
+    float tmp[c_rows_per_warp] = {0.0f};
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int i = 0; i < c_rows_per_warp; ++i) {
+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+
+#pragma unroll
+    for (int i = 0; i < c_rows_per_warp; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if (threadIdx.x == i) {
+            dst[i] = tmp[i];
+        }
+    }
+}
+
+template <ggml_type type, int c_rows_per_warp>
+static void mul_mat_vec_q_warp_launch(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const int nchannels_dst, const int nsamples_dst, const int warp_size, const int nsm, cudaStream_t stream) {
+    const int64_t nwarps_rows = nrows_x / c_rows_per_warp;
+    const int64_t total_warps = nwarps_rows * nchannels_dst * nsamples_dst;
+    const int nwarps_block = (nwarps_rows >= 4 && total_warps >= 16LL*nsm) ? 4
+                           : (nwarps_rows >= 2 && total_warps >=  8LL*nsm) ? 2 : 1;
+    const int64_t nblocks = (nwarps_rows + nwarps_block - 1) / nwarps_block;
+    const dim3 block_nums(nblocks, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, nwarps_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_warp<type, c_rows_per_warp>, launch_params,
+        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
 }
 
 template<ggml_type type>
@@ -1126,7 +1203,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.gate_scale != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1162,7 +1239,7 @@ static void mul_mat_vec_q_moe_launch_rows(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.gate_scale != nullptr;
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
@@ -1330,6 +1407,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             };
+
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                const bool has_fusion_g = fusion.gate != nullptr || fusion.x_bias != nullptr ||
+                                          fusion.gate_bias != nullptr || fusion.gate_scale != nullptr ||
+                                          fusion.shared_up != nullptr;
+                if (!has_fusion_g && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+                    const int nsm = ggml_cuda_info().devices[device].nsm;
+                    mul_mat_vec_q_warp_launch<GGML_TYPE_Q8_0, 1>(
+                        vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+                        stride_row_x, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        nchannels_dst, nsamples_dst, warp_size, nsm, stream);
+                    break;
+                }
+            }
 
             if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
@@ -1649,9 +1741,12 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
-    // src1 quantized by an earlier MUL_MAT of this graph that read the same tensor is reused as is
+    // src1 quantized by an earlier op of this graph that produced or read the same tensor is reused as is
+    // for MUL_MAT_ID only peek, never allocate/release on the LIFO pool
     bool src1_q8_1_cached = false;
-    void * src1_q8_1_reuse = ids ? nullptr : ggml_cuda_src1_cache_get(ctx, src1, /*layout =*/ 0, nbytes_src1_q8_1, &src1_q8_1_cached);
+    void * src1_q8_1_reuse = ids
+        ? ggml_cuda_src1_cache_peek(ctx, src1, /*layout =*/ 0, nbytes_src1_q8_1, &src1_q8_1_cached)
+        : ggml_cuda_src1_cache_get(ctx, src1, /*layout =*/ 0, nbytes_src1_q8_1, &src1_q8_1_cached);
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
     char * src1_q8_1 = src1_q8_1_reuse ? (char *) src1_q8_1_reuse : src1_q8_1_own.alloc(nbytes_src1_q8_1);
     if (!src1_q8_1_cached) {

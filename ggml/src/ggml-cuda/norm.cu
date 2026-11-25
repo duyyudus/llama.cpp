@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "ggml-common.h"
 #include "convert.cuh"
 #include <cstdint>
 
@@ -529,7 +530,11 @@ static void rms_norm_f32_dispatch(
         } else if (n4 <= 512) {
             RMS_NORM_LAUNCH(512,  1, true);
         } else if (n4 <= 1024) {
-            RMS_NORM_LAUNCH(1024, 1, true);
+            if constexpr (!do_multiply) {
+                RMS_NORM_LAUNCH(256,  4, true);
+            } else {
+                RMS_NORM_LAUNCH(512,  2, true);
+            }
         } else if (n4 <= 4096) {
             RMS_NORM_LAUNCH(1024, 4, true);
         } else {
@@ -830,7 +835,77 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+// Single-row F32 RMS_NORM * weight with bit-exact Q8_1 side-output (8 lanes of float4 = 32 elements = 1 block_q8_1).
+template <int block_size, int vpt>
+static __global__ void rms_norm_mul_f32_q8_1(
+        const float4 * __restrict__ x4, const float4 * __restrict__ mul4,
+        float4 * __restrict__ dst4, block_q8_1 * __restrict__ dst_q8_1,
+        const int ncols, const int ncols_padded, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int tid    = threadIdx.x;
+    const int ncols4 = ncols / 4;
+    const int npad4  = ncols_padded / 4;
+    extern __shared__ float s_sum[];
+
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int k = 0; k < vpt; ++k) {
+        const int i = tid + k * block_size;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+    for (int k = 0; k < vpt; ++k) {
+        const int i = tid + k * block_size;
+        if (i < ncols4) {
+            const float4 m = mul4[i];
+            const float4 r = make_float4(scale*xs[k].x*m.x, scale*xs[k].y*m.y, scale*xs[k].z*m.z, scale*xs[k].w*m.w);
+            dst4[i] = r;
+
+            float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 1, 32));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 2, 32));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 4, 32));
+
+            const float  d  = amax / 127.0f;
+            const int8_t q0 = amax == 0.0f ? 0 : (int8_t) roundf(r.x / d);
+            const int8_t q1 = amax == 0.0f ? 0 : (int8_t) roundf(r.y / d);
+            const int8_t q2 = amax == 0.0f ? 0 : (int8_t) roundf(r.z / d);
+            const int8_t q3 = amax == 0.0f ? 0 : (int8_t) roundf(r.w / d);
+            int sum = (int) q0 + (int) q1 + (int) q2 + (int) q3;
+            sum += ggml_cuda_shfl_xor(sum, 1, 32);
+            sum += ggml_cuda_shfl_xor(sum, 2, 32);
+            sum += ggml_cuda_shfl_xor(sum, 4, 32);
+
+            const int ib  = i >> 3;
+            const int sub = i & 7;
+            const uint32_t q4 = (uint32_t) (uint8_t) q0 | ((uint32_t) (uint8_t) q1 << 8) |
+                                ((uint32_t) (uint8_t) q2 << 16) | ((uint32_t) (uint8_t) q3 << 24);
+            ((uint32_t *) dst_q8_1[ib].qs)[sub] = q4;
+            if (sub == 0) {
+                dst_q8_1[ib].ds = make_half2(d, d * sum);
+            }
+        } else if (i < npad4) {
+            const int ib  = i >> 3;
+            const int sub = i & 7;
+            ((uint32_t *) dst_q8_1[ib].qs)[sub] = 0;
+            if (sub == 0) {
+                dst_q8_1[ib].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+        void * dst_q8_1, int64_t ncols_padded) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -858,6 +933,20 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne01 = rms_norm_src->ne[1];
     const int64_t ne02 = rms_norm_src->ne[2];
     const int64_t ne03 = rms_norm_src->ne[3];
+
+    if (dst_q8_1 && rms_norm_src->type == GGML_TYPE_F32 &&
+            ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+            mul_src->ne[0] == ne00 && mul_src->ne[1] == 1 && mul_src->ne[2] == 1 && mul_src->ne[3] == 1 &&
+            (ne00 % QK8_1) == 0 && (ncols_padded % QK8_1) == 0 && ncols_padded <= 4096 &&
+            ((uintptr_t) rms_norm_src->data & 15) == 0 && ((uintptr_t) mul_src->data & 15) == 0 &&
+            ((uintptr_t) mul_tensor->data & 15) == 0) {
+        const ggml_cuda_kernel_launch_params launch_params(dim3(1, 1, 1), dim3(512, 1, 1), 32 * sizeof(float), stream);
+        ggml_cuda_kernel_launch(rms_norm_mul_f32_q8_1<512, 2>, launch_params,
+            (const float4 *) rms_norm_src->data, (const float4 *) mul_src->data,
+            (float4 *) mul_tensor->data, (block_q8_1 *) dst_q8_1,
+            (int) ne00, (int) ncols_padded, eps);
+        return;
+    }
 
     const size_t ts0 = ggml_type_size(rms_norm_src->type);
     GGML_ASSERT(rms_norm_src->nb[0] == ts0);

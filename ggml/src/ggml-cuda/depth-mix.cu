@@ -269,6 +269,12 @@ static bool depth_mix_is_transpose_stack(const ggml_tensor * s, const ggml_tenso
         s->ne[1] == 1 && st->ne[0] == 1 && s->ne[0] == st->ne[1] && s->ne[2] == st->ne[2]) {
         return true;
     }
+    if (st->op == GGML_OP_CONT && st->src[0] && st->src[0]->op == GGML_OP_PERMUTE &&
+        st->src[0]->src[0] == s &&
+        st->src[0]->op_params[0] == 1 && st->src[0]->op_params[1] == 0 &&
+        st->src[0]->op_params[2] == 2 && st->src[0]->op_params[3] == 3) {
+        return true;
+    }
     if (s->op == GGML_OP_CONCAT && st->op == GGML_OP_CONCAT &&
         ggml_get_op_params_i32(s, 0) == 1 && ggml_get_op_params_i32(st, 0) == 0) {
         return depth_mix_is_transpose_stack(s->src[0], st->src[0], depth + 1) &&
@@ -287,8 +293,11 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     //   (b) CONCAT (prev, normed, dim 1), [REPEAT,] MUL_MAT, SOFT_MAX, [PERMUTE, CONT, MUL_MAT]
     //   (c) [REPEAT,] MUL_MAT (states, q), SOFT_MAX, MUL_MAT (states_t, scores) over a pre-built stack
     ggml_tensor * first = cgraph->nodes[i];
+    const bool form_b_rms = first->src[1] && first->src[1]->op == GGML_OP_RMS_NORM;
+    const bool form_b_rsh = first->src[1] && first->src[1]->op == GGML_OP_RESHAPE &&
+        first->src[1]->src[0] && first->src[1]->src[0]->op == GGML_OP_RMS_NORM;
     const bool form_b = first->op == GGML_OP_CONCAT && ggml_get_op_params_i32(first, 0) == 1 &&
-        first->src[1]->op == GGML_OP_RMS_NORM;
+        (form_b_rms || form_b_rsh);
     const bool form_c = first->op == GGML_OP_REPEAT || first->op == GGML_OP_MUL_MAT;
     ggml_tensor * cat_t    = nullptr; // form (a): the transposed CONCAT; form (b): the CONT of the permuted rows
     ggml_tensor * perm     = nullptr; // form (b) only
@@ -510,8 +519,10 @@ int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * ctx, ggml_cgraph * 
     bool one_block = false;
     if (!memory_ok(cgraph, i, count, outs, n_outs)) {
         auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
-            const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-            const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+            const ggml_tensor * ab = a->view_src ? a->view_src : a;
+            const ggml_tensor * bb = b->view_src ? b->view_src : b;
+            const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_backend_buft_get_alloc_size(ab->buffer->buft, a);
+            const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_backend_buft_get_alloc_size(bb->buffer->buft, b);
             return a0 < b1 && b0 < a1;
         };
         const ggml_tensor * srcs[4] = { prev, prev_t ? prev_t : prev, q, rms };
